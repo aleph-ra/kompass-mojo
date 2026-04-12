@@ -1,0 +1,14 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# build artifacts
+build/
+integration/build/
+
+# local results
+results/
+
+# editor
+*.swp
+.DS_Store
