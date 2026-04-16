@@ -4,7 +4,7 @@ from std.gpu import global_idx
 from std.memory import UnsafePointer
 
 
-fn add_kernel(
+def add_kernel(
     a: UnsafePointer[Float32, MutAnyOrigin],
     b: UnsafePointer[Float32, MutAnyOrigin],
     c: UnsafePointer[Float32, MutAnyOrigin],
@@ -15,7 +15,7 @@ fn add_kernel(
         c[tid] = a[tid] + b[tid]
 
 
-def main():
+def main() raises:
     var ctx = DeviceContext()
     print("device:", ctx.name())
 

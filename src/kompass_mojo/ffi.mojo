@@ -27,8 +27,7 @@ from kompass_mojo.cost_evaluator import (
 # ---------------------------------------------------------------------------
 
 
-@register_passable("trivial")
-struct MojoCostEvalConfig:
+struct MojoCostEvalConfig(TrivialRegisterPassable):
     var acc_lim_x: F32
     var acc_lim_y: F32
     var acc_lim_omega: F32
@@ -69,7 +68,7 @@ struct CostEvalHandle(Movable):
     var max_obstacles: Int
     var cfg: MojoCostEvalConfig
 
-    fn __init__(
+    def __init__(
         out self,
         max_trajs: Int,
         points_per_traj: Int,
@@ -112,7 +111,7 @@ struct CostEvalHandle(Movable):
 
 
 @export
-fn mojo_cost_eval_create(
+def mojo_cost_eval_create(
     max_trajs: Int32,
     points_per_traj: Int32,
     max_obstacles: Int32,
@@ -134,14 +133,14 @@ fn mojo_cost_eval_create(
 
 
 @export
-fn mojo_cost_eval_destroy(handle: UnsafePointer[CostEvalHandle, MutExternalOrigin]):
+def mojo_cost_eval_destroy(handle: UnsafePointer[CostEvalHandle, MutExternalOrigin]):
     if handle:
         handle.destroy_pointee()
         handle.free()
 
 
 @export
-fn mojo_cost_eval_run(
+def mojo_cost_eval_run(
     handle: UnsafePointer[CostEvalHandle, MutExternalOrigin],
     host_paths_x: UnsafePointer[F32, MutExternalOrigin],
     host_paths_y: UnsafePointer[F32, MutExternalOrigin],
@@ -182,7 +181,7 @@ fn mojo_cost_eval_run(
     return Int32(0)
 
 
-fn _run_impl(
+def _run_impl(
     handle: UnsafePointer[CostEvalHandle, MutExternalOrigin],
     host_paths_x: UnsafePointer[F32, MutExternalOrigin],
     host_paths_y: UnsafePointer[F32, MutExternalOrigin],
@@ -331,7 +330,7 @@ fn _run_impl(
 # ---------------------------------------------------------------------------
 
 
-fn _memcpy_h2d(
+def _memcpy_h2d(
     ctx: DeviceContext,
     dst: DeviceBuffer[DTYPE],
     host_src: UnsafePointer[F32, MutExternalOrigin],
@@ -340,7 +339,7 @@ fn _memcpy_h2d(
     ctx.enqueue_copy(dst_buf=dst, src_ptr=host_src)
 
 
-fn _memcpy_d2h_one_f32(
+def _memcpy_d2h_one_f32(
     ctx: DeviceContext,
     host_dst: UnsafePointer[F32, MutExternalOrigin],
     src: DeviceBuffer[DTYPE],
@@ -348,7 +347,7 @@ fn _memcpy_d2h_one_f32(
     ctx.enqueue_copy(dst_ptr=host_dst, src_buf=src)
 
 
-fn _memcpy_d2h_one_i32(
+def _memcpy_d2h_one_i32(
     ctx: DeviceContext,
     host_dst: UnsafePointer[Int32, MutExternalOrigin],
     src: DeviceBuffer[DType.int32],

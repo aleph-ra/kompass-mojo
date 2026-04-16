@@ -45,7 +45,7 @@ comptime F32_INF: F32 = F32_MAX       # padding sentinel (large enough)
 # ---------------------------------------------------------------------------
 
 
-fn goal_cost_kernel(
+def goal_cost_kernel(
     paths_x: UnsafePointer[F32, MutAnyOrigin],
     paths_y: UnsafePointer[F32, MutAnyOrigin],
     costs: UnsafePointer[F32, MutAnyOrigin],
@@ -78,7 +78,7 @@ fn goal_cost_kernel(
 # ---------------------------------------------------------------------------
 
 
-fn smoothness_cost_kernel(
+def smoothness_cost_kernel(
     vel_vx: UnsafePointer[F32, MutAnyOrigin],
     vel_vy: UnsafePointer[F32, MutAnyOrigin],
     vel_omega: UnsafePointer[F32, MutAnyOrigin],
@@ -117,8 +117,7 @@ fn smoothness_cost_kernel(
     partials[tid] = local_contrib
     barrier()
 
-    @parameter
-    for step in range(LOG2_WG):
+    comptime for step in range(LOG2_WG):
         if tid < (WG_SIZE >> (step + 1)):
             partials[tid] = partials[tid] + partials[tid + (WG_SIZE >> (step + 1))]
         barrier()
@@ -139,7 +138,7 @@ fn smoothness_cost_kernel(
 # ---------------------------------------------------------------------------
 
 
-fn jerk_cost_kernel(
+def jerk_cost_kernel(
     vel_vx: UnsafePointer[F32, MutAnyOrigin],
     vel_vy: UnsafePointer[F32, MutAnyOrigin],
     vel_omega: UnsafePointer[F32, MutAnyOrigin],
@@ -179,8 +178,7 @@ fn jerk_cost_kernel(
     partials[tid] = local_contrib
     barrier()
 
-    @parameter
-    for step in range(LOG2_WG):
+    comptime for step in range(LOG2_WG):
         if tid < (WG_SIZE >> (step + 1)):
             partials[tid] = partials[tid] + partials[tid + (WG_SIZE >> (step + 1))]
         barrier()
@@ -204,7 +202,7 @@ fn jerk_cost_kernel(
 # ---------------------------------------------------------------------------
 
 
-fn ref_path_cost_kernel(
+def ref_path_cost_kernel(
     paths_x: UnsafePointer[F32, MutAnyOrigin],
     paths_y: UnsafePointer[F32, MutAnyOrigin],
     tracked_x: UnsafePointer[F32, MutAnyOrigin],
@@ -260,8 +258,7 @@ fn ref_path_cost_kernel(
             barrier()
 
             if valid_ref_point:
-                @parameter
-                for t in range(WG_SIZE):
+                comptime for t in range(WG_SIZE):
                     var dx = rx - tile_tx[t]
                     var dy = ry - tile_ty[t]
                     var d2 = dx * dx + dy * dy
@@ -279,8 +276,7 @@ fn ref_path_cost_kernel(
     partials[tid] = local_total_dist
     barrier()
 
-    @parameter
-    for step in range(LOG2_WG):
+    comptime for step in range(LOG2_WG):
         if tid < (WG_SIZE >> (step + 1)):
             partials[tid] = partials[tid] + partials[tid + (WG_SIZE >> (step + 1))]
         barrier()
@@ -311,7 +307,7 @@ fn ref_path_cost_kernel(
 # ---------------------------------------------------------------------------
 
 
-fn obstacles_dist_cost_kernel(
+def obstacles_dist_cost_kernel(
     paths_x: UnsafePointer[F32, MutAnyOrigin],
     paths_y: UnsafePointer[F32, MutAnyOrigin],
     obs_x: UnsafePointer[F32, MutAnyOrigin],
@@ -354,8 +350,7 @@ fn obstacles_dist_cost_kernel(
             var px = paths_x[traj_idx * path_size + k]
             var py = paths_y[traj_idx * path_size + k]
 
-            @parameter
-            for j in range(WG_SIZE):
+            comptime for j in range(WG_SIZE):
                 var dx = px - tile_ox[j]
                 var dy = py - tile_oy[j]
                 var d2 = dx * dx + dy * dy
@@ -370,8 +365,7 @@ fn obstacles_dist_cost_kernel(
     partials[tid] = min_dist_sq_for_point
     barrier()
 
-    @parameter
-    for step in range(LOG2_WG):
+    comptime for step in range(LOG2_WG):
         if tid < (WG_SIZE >> (step + 1)):
             var a = partials[tid]
             var b = partials[tid + (WG_SIZE >> (step + 1))]
@@ -400,7 +394,7 @@ fn obstacles_dist_cost_kernel(
 # ---------------------------------------------------------------------------
 
 
-fn min_cost_block_reduce(
+def min_cost_block_reduce(
     costs: UnsafePointer[F32, MutAnyOrigin],
     block_min_cost: UnsafePointer[F32, MutAnyOrigin],
     block_min_idx: UnsafePointer[Int32, MutAnyOrigin],
@@ -425,8 +419,7 @@ fn min_cost_block_reduce(
 
     barrier()
 
-    @parameter
-    for step in range(LOG2_WG):
+    comptime for step in range(LOG2_WG):
         if tid < (WG_SIZE >> (step + 1)):
             var other = tid + (WG_SIZE >> (step + 1))
             var a_cost = s_cost[tid]
@@ -444,7 +437,7 @@ fn min_cost_block_reduce(
         block_min_idx[Int(block_idx.x)] = s_idx[0]
 
 
-fn min_cost_final_reduce(
+def min_cost_final_reduce(
     block_min_cost: UnsafePointer[F32, MutAnyOrigin],
     block_min_idx: UnsafePointer[Int32, MutAnyOrigin],
     out_cost: UnsafePointer[F32, MutAnyOrigin],
@@ -477,8 +470,7 @@ fn min_cost_final_reduce(
     s_idx[tid] = my_idx
     barrier()
 
-    @parameter
-    for step in range(LOG2_WG):
+    comptime for step in range(LOG2_WG):
         if tid < (WG_SIZE >> (step + 1)):
             var other = tid + (WG_SIZE >> (step + 1))
             var a_cost = s_cost[tid]
