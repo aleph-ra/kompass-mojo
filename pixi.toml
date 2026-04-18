@@ -15,3 +15,4 @@ build-harness = { cmd = "cmake -S integration -B integration/build -DCMAKE_BUILD
 benchmark = { cmd = "bash -c 'mkdir -p results && integration/build/kompass_benchmark_mojo ${PLATFORM:-gpu} results/${PLATFORM:-gpu}.json'", depends-on = ["build-harness"] }
 test = { cmd = "mojo run -I src tests/test_cost_evaluator.mojo" }
 test-mapper = { cmd = "mojo run -I src tests/test_local_mapper.mojo" }
+test-critical-zone = { cmd = "mojo run -I src tests/test_critical_zone.mojo" }
