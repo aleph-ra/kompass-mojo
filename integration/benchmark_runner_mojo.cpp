@@ -1,24 +1,10 @@
-// Standalone benchmark runner for the Mojo cost evaluator.
+// Standalone benchmark runner for the Mojo kernels.
 //
-// Mirrors the CostEvaluator_5k_Trajs scenario from kompass-core's
-// src/kompass_cpp/benchmarks/benchmark_runner.cpp (lines 150-185) but
-// dispatches to libkompass_mojo.so via C FFI instead of the SYCL
-// CostEvaluator class. Same workload parameters, same measurement
-// methodology, same output JSON schema — so the resulting file drops
-// directly into plot_benchmarks.py alongside benchmark_cuda.json etc.
-//
-// Workload replication (matches benchmark_runner.cpp:150-185):
-//   predictionHorizon = 10.0 s, timeStep = 0.01 s
-//   numTrajectories = 5001, points_per_traj = 1000, velocities_count = 999
-//   Reference path = 3 points [(0,0), (5,0), (10,0)] interpolated linearly
-//     at 0.01 m spacing then segmented to length 1000, giving ref_size = 1001
-//   Trajectory generator: center path + (pairs-1)/2 linear + angular sine
-//     fluctuation variants
-//   Weights: ref_path=1.0, smoothness=1.0, jerk=1.0, goal=1.0, obstacles=0.0
-//   Control limits: acc_x=3, acc_y=3, acc_omega=3
-//
+// Mirrors scenarios from kompass-core's
+// src/kompass_cpp/benchmarks/benchmark_runner.cpp but
+// dispatches to libkompass_mojo.so via C FFI
 // Build: cmake -B build integration && cmake --build build
-// Run:   LD_LIBRARY_PATH=../build ./build/kompass_benchmark_mojo  <platform>  <out.json>
+// Run: LD_LIBRARY_PATH=../build ./build/kompass_benchmark_mojo  <platform>  <out.json>
 
 #include "benchmark_common.h"
 #include "kompass_mojo.h"
@@ -26,7 +12,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -142,6 +127,26 @@ struct FlatRefPath {
     float length;
 };
 
+// =============================================================================
+// Mapping scan generator
+//
+// Produces a laserscan with `num_points` rays spaced evenly across 2*pi, with
+// a sinusoidally-modulated range.
+// =============================================================================
+
+static void generate_mapping_scan(size_t num_points,
+                                  std::vector<double>& ranges,
+                                  std::vector<double>& angles) {
+    ranges.resize(num_points);
+    angles.resize(num_points);
+    double angle_step = (2.0 * M_PI) / num_points;
+    for (size_t i = 0; i < num_points; ++i) {
+        angles[i] = -M_PI + (i * angle_step);
+        ranges[i] = 5.0 + 2.0 * std::sin(angles[i] * 20.0);
+    }
+}
+
+
 static FlatRefPath generate_ref_path_flat() {
     FlatRefPath r;
     // Match kompass-core's reference_path.interpolate(0.01, LINEAR) on waypoints
@@ -173,6 +178,9 @@ int main(int argc, char* argv[]) {
     std::string platform_alias = argv[1];
     std::string output_path = argv[2];
 
+    // =========================================================================
+    // TEST 1: CostEvaluator
+    // =========================================================================
     LOG_INFO("===================================================");
     LOG_INFO("  KOMPASS-MOJO BENCHMARK (cost evaluator)");
     LOG_INFO("  Target: " << platform_alias);
@@ -239,6 +247,60 @@ int main(int argc, char* argv[]) {
     LOG_INFO("Final min cost idx: " << out_min_idx << "  cost: " << out_min_cost);
 
     mojo_cost_eval_destroy(handle);
+
+    // =========================================================================
+    // TEST 2: LocalMapper
+    //
+    // 400x400 grid at 0.05 m resolution. scan_size matches the generated scan
+    // (3600 rays, all processed).
+    // =========================================================================
+    {
+        int rows = 400;
+        int cols = 400;
+        float res = 0.05f;
+        int scan_size = 3600;
+        int max_points_per_line = 256;
+
+        std::vector<double> ranges, angles;
+        generate_mapping_scan(3600, ranges, angles);
+
+        MojoLocalMapperConfig mcfg{};
+        mcfg.resolution = res;
+        mcfg.laserscan_orientation = 0.0f;
+        mcfg.laserscan_pos_x = 0.0f;
+        mcfg.laserscan_pos_y = 0.0f;
+        mcfg.laserscan_pos_z = 0.0f;
+
+        MojoLocalMapperHandle mh = mojo_local_mapper_create(
+            rows, cols, scan_size, max_points_per_line, &mcfg);
+        if (!mh) {
+            LOG_ERROR("mojo_local_mapper_create returned null");
+            return 3;
+        }
+
+        std::vector<int32_t> grid_out(static_cast<size_t>(rows) * cols);
+
+        auto map_workload = [&]() {
+            int rc = mojo_local_mapper_run(
+                mh, angles.data(), ranges.data(), grid_out.data());
+            if (rc != 0) {
+                LOG_ERROR("mojo_local_mapper_run returned " << rc);
+            }
+        };
+
+        results.push_back(measure_performance("Mapper_Dense_400x400", map_workload));
+
+        // Sanity-log the occupied-cell count so we can spot regressions where
+        // the kernel accidentally no-ops.
+        size_t n_occupied = 0;
+        for (int32_t v : grid_out) {
+            if (v == 100) ++n_occupied;
+        }
+        LOG_INFO("Mapper: " << n_occupied << " OCCUPIED cells (out of "
+                            << grid_out.size() << ")");
+
+        mojo_local_mapper_destroy(mh);
+    }
 
     save_results_to_json(platform_alias, results, output_path);
     return 0;
