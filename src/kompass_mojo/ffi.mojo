@@ -4,7 +4,7 @@
 # in integration/kompass_mojo.h — keep that file in sync with the @export
 # signatures below.
 
-from std.math import ceildiv
+from std.math import ceildiv, sqrt
 from std.memory import UnsafePointer, alloc
 from std.gpu.host import DeviceContext, DeviceBuffer
 
@@ -19,6 +19,10 @@ from kompass_mojo.cost_evaluator import (
     obstacles_dist_cost_kernel,
     min_cost_block_reduce,
     min_cost_final_reduce,
+)
+from kompass_mojo.local_mapper import (
+    OCC_UNEXPLORED,
+    scan_to_grid_kernel,
 )
 
 
@@ -353,3 +357,173 @@ def _memcpy_d2h_one_i32(
     src: DeviceBuffer[DType.int32],
 ) raises:
     ctx.enqueue_copy(dst_ptr=host_dst, src_buf=src)
+
+
+# ===========================================================================
+# Local mapper FFI
+#
+# Exposes create/run/destroy over a LocalMapperGPU interface.
+# See integration/kompass_mojo.h for the C contract.
+# ===========================================================================
+
+
+struct MojoLocalMapperConfig(TrivialRegisterPassable):
+    var resolution: F32
+    var laserscan_orientation: F32
+    var laserscan_pos_x: F32
+    var laserscan_pos_y: F32
+    var laserscan_pos_z: F32   # unused by kernel, kept for parity with SYCL
+
+
+struct MapperHandle(Movable):
+    var ctx: DeviceContext
+    var grid: DeviceBuffer[DType.int32]
+    var distances: DeviceBuffer[DType.float32]
+    var ranges: DeviceBuffer[DType.float64]
+    var angles: DeviceBuffer[DType.float64]
+
+    var rows: Int
+    var cols: Int
+    var scan_size: Int
+    var max_points_per_line: Int
+    var cfg: MojoLocalMapperConfig
+
+    # Geometry precomputed once
+    var central_x: Int32
+    var central_y: Int32
+    var start_x: Int32
+    var start_y: Int32
+
+    def __init__(
+        out self,
+        rows: Int,
+        cols: Int,
+        scan_size: Int,
+        max_points_per_line: Int,
+        cfg: MojoLocalMapperConfig,
+    ) raises:
+        self.ctx = DeviceContext()
+        self.rows = rows
+        self.cols = cols
+        self.scan_size = scan_size
+        self.max_points_per_line = max_points_per_line
+        self.cfg = cfg
+
+        # Match std::round(int/2) - 1.
+        # For int dividends this is just integer division minus one.
+        self.central_x = Int32(rows // 2 - 1)
+        self.central_y = Int32(cols // 2 - 1)
+        self.start_x = self.central_x + Int32(
+            Int(cfg.laserscan_pos_x / cfg.resolution)
+        )
+        self.start_y = self.central_y + Int32(
+            Int(cfg.laserscan_pos_y / cfg.resolution)
+        )
+
+        var cells = rows * cols
+        self.grid = self.ctx.enqueue_create_buffer[DType.int32](cells)
+        self.distances = self.ctx.enqueue_create_buffer[DType.float32](cells)
+        self.ranges = self.ctx.enqueue_create_buffer[DType.float64](scan_size)
+        self.angles = self.ctx.enqueue_create_buffer[DType.float64](scan_size)
+
+        # Precompute per-cell distance from laserscan origin
+        var host_dist = self.ctx.enqueue_create_host_buffer[DType.float32](cells)
+        var dst = host_dist.unsafe_ptr().value()
+        for j in range(cols):
+            for i in range(rows):
+                var dest_x = F32(self.central_x - Int32(i)) * cfg.resolution
+                var dest_y = F32(self.central_y - Int32(j)) * cfg.resolution
+                var diff_x = dest_x - cfg.laserscan_pos_x
+                var diff_y = dest_y - cfg.laserscan_pos_y
+                var diff_z = F32(0.0) - cfg.laserscan_pos_z
+                var d2 = diff_x * diff_x + diff_y * diff_y + diff_z * diff_z
+                (dst + (i + j * rows))[] = sqrt(d2)
+        self.ctx.enqueue_copy(dst_buf=self.distances, src_buf=host_dist)
+        self.ctx.synchronize()
+
+
+@export
+def mojo_local_mapper_create(
+    rows: Int32,
+    cols: Int32,
+    scan_size: Int32,
+    max_points_per_line: Int32,
+    cfg: UnsafePointer[MojoLocalMapperConfig, MutExternalOrigin],
+) -> UnsafePointer[MapperHandle, MutExternalOrigin]:
+    try:
+        var p = alloc[MapperHandle](1)
+        p.init_pointee_move(
+            MapperHandle(
+                Int(rows),
+                Int(cols),
+                Int(scan_size),
+                Int(max_points_per_line),
+                cfg[0],
+            )
+        )
+        return p
+    except:
+        return UnsafePointer[MapperHandle, MutExternalOrigin]()
+
+
+@export
+def mojo_local_mapper_destroy(
+    handle: UnsafePointer[MapperHandle, MutExternalOrigin],
+):
+    if handle:
+        handle.destroy_pointee()
+        handle.free()
+
+
+@export
+def mojo_local_mapper_run(
+    handle: UnsafePointer[MapperHandle, MutExternalOrigin],
+    host_angles: UnsafePointer[Float64, MutExternalOrigin],
+    host_ranges: UnsafePointer[Float64, MutExternalOrigin],
+    host_grid_out: UnsafePointer[Int32, MutExternalOrigin],
+) -> Int32:
+    if not handle:
+        return Int32(-1)
+    try:
+        _mapper_run_impl(handle, host_angles, host_ranges, host_grid_out)
+    except e:
+        print("mojo_local_mapper_run error:", e)
+        return Int32(-2)
+    return Int32(0)
+
+
+def _mapper_run_impl(
+    handle: UnsafePointer[MapperHandle, MutExternalOrigin],
+    host_angles: UnsafePointer[Float64, MutExternalOrigin],
+    host_ranges: UnsafePointer[Float64, MutExternalOrigin],
+    host_grid_out: UnsafePointer[Int32, MutExternalOrigin],
+) raises:
+    ref h = handle[]
+
+    # 1. Reset grid to UNEXPLORED (matches m_q.fill in scanToGrid).
+    h.ctx.enqueue_memset(h.grid, OCC_UNEXPLORED)
+
+    # 2. H->D: angles and ranges.
+    h.ctx.enqueue_copy(dst_buf=h.angles, src_ptr=host_angles)
+    h.ctx.enqueue_copy(dst_buf=h.ranges, src_ptr=host_ranges)
+
+    # 3. Launch.
+    h.ctx.enqueue_function[scan_to_grid_kernel, scan_to_grid_kernel](
+        h.ranges.unsafe_ptr(),
+        h.angles.unsafe_ptr(),
+        h.grid.unsafe_ptr(),
+        h.distances.unsafe_ptr(),
+        h.rows, h.cols,
+        h.cfg.resolution,
+        h.cfg.laserscan_orientation,
+        h.cfg.laserscan_pos_x,
+        h.cfg.laserscan_pos_y,
+        h.central_x, h.central_y,
+        h.start_x, h.start_y,
+        grid_dim=h.scan_size,
+        block_dim=h.max_points_per_line,
+    )
+
+    # 4. D->H grid.
+    h.ctx.enqueue_copy(dst_ptr=host_grid_out, src_buf=h.grid)
+    h.ctx.synchronize()
