@@ -4,7 +4,7 @@
 # in integration/kompass_mojo.h — keep that file in sync with the @export
 # signatures below.
 
-from std.math import ceildiv, sqrt
+from std.math import ceildiv, sqrt, cos, sin
 from std.memory import UnsafePointer, alloc
 from std.gpu.host import DeviceContext, DeviceBuffer
 
@@ -23,6 +23,10 @@ from kompass_mojo.cost_evaluator import (
 from kompass_mojo.local_mapper import (
     OCC_UNEXPLORED,
     scan_to_grid_kernel,
+)
+from kompass_mojo.critical_zone import (
+    critical_zone_laserscan_kernel,
+    critical_zone_pointcloud_kernel,
 )
 
 
@@ -526,4 +530,348 @@ def _mapper_run_impl(
 
     # 4. D->H grid.
     h.ctx.enqueue_copy(dst_ptr=host_grid_out, src_buf=h.grid)
+    h.ctx.synchronize()
+
+
+# ===========================================================================
+# Critical-zone checker FFI
+#
+# Third kernel group. Exposes create/destroy + two run methods (laserscan
+# and pointcloud) over a CriticalZoneCheckerGPU-like interface. See
+# integration/kompass_mojo.h for the C contract.
+# ===========================================================================
+
+
+struct MojoCritZoneConfig(TrivialRegisterPassable):
+    # 2D submatrix of the sensor→body Isometry3f. The kernels drop z so
+    # only six scalars are needed.
+    var tf00: F32
+    var tf01: F32
+    var tf03: F32
+    var tf10: F32
+    var tf11: F32
+    var tf13: F32
+    # Safety geometry.
+    var robot_radius: F32
+    var critical_angle: F32     # half-angle in radians (must be <= pi/2)
+    var critical_distance: F32
+    var slowdown_distance: F32
+    # Z-filter bounds for the pointcloud path.
+    var min_height: F32
+    var max_height: F32
+
+
+struct CritZoneHandle(Movable):
+    var ctx: DeviceContext
+    # Laserscan buffers (allocated when scan_size > 0, otherwise 1-element
+    # placeholders).
+    var ranges: DeviceBuffer[DTYPE]
+    var cos_angles: DeviceBuffer[DTYPE]
+    var sin_angles: DeviceBuffer[DTYPE]
+    var fwd_indices: DeviceBuffer[DType.int32]
+    var bwd_indices: DeviceBuffer[DType.int32]
+    # Pointcloud buffer, grown on demand in run_pointcloud.
+    var raw_bytes: DeviceBuffer[DType.int8]
+    var raw_capacity: Int
+    # Shared output.
+    var out_factor: DeviceBuffer[DTYPE]
+
+    var scan_size: Int
+    var n_fwd: Int
+    var n_bwd: Int
+    var cfg: MojoCritZoneConfig
+
+    # Derived kernel-friendly constants.
+    var cos_sq_crit_angle: F32
+    var dist_denom: F32
+    var safe_threshold_sq: F32
+    var inv_dist_range: F32
+
+    def __init__(
+        out self,
+        scan_angles: UnsafePointer[Float64, MutExternalOrigin],
+        scan_size: Int,
+        max_cloud_bytes: Int,
+        cfg: MojoCritZoneConfig,
+    ) raises:
+        self.ctx = DeviceContext()
+        self.cfg = cfg
+        self.scan_size = scan_size
+        self.n_fwd = 0
+        self.n_bwd = 0
+        self.raw_capacity = 0
+
+        # Derived constants computed once on host.
+        var c = cos(cfg.critical_angle)
+        self.cos_sq_crit_angle = F32(c * c)
+        self.dist_denom = cfg.slowdown_distance - cfg.critical_distance
+        var safe = cfg.slowdown_distance + cfg.robot_radius
+        self.safe_threshold_sq = safe * safe
+        self.inv_dist_range = F32(1.0) / self.dist_denom
+
+        self.out_factor = self.ctx.enqueue_create_buffer[DTYPE](1)
+
+        # Laserscan-side buffers, only meaningful when scan_size > 0.
+        var scan_alloc = scan_size if scan_size > 0 else 1
+        self.ranges = self.ctx.enqueue_create_buffer[DTYPE](scan_alloc)
+        self.cos_angles = self.ctx.enqueue_create_buffer[DTYPE](scan_alloc)
+        self.sin_angles = self.ctx.enqueue_create_buffer[DTYPE](scan_alloc)
+
+        if scan_size > 0:
+            # Compute presets, cos_i, sin_i host-side. Classify each angle into
+            # fwd/bwd cones using the same test as the kernel, applied against
+            # the body-frame point (tf00*c + tf01*s + tf03, tf10*c + tf11*s + tf13).
+            var host_cos = self.ctx.enqueue_create_host_buffer[DTYPE](scan_size)
+            var host_sin = self.ctx.enqueue_create_host_buffer[DTYPE](scan_size)
+            var cos_ptr = host_cos.unsafe_ptr().value()
+            var sin_ptr = host_sin.unsafe_ptr().value()
+            var host_fwd = List[Int32]()
+            var host_bwd = List[Int32]()
+
+            for i in range(scan_size):
+                var theta = (scan_angles + i)[]
+                var c_t = F32(cos(theta))
+                var s_t = F32(sin(theta))
+                (cos_ptr + i)[] = c_t
+                (sin_ptr + i)[] = s_t
+
+                # Body-frame transform of direction (c, s, 0).
+                var x_body = cfg.tf00 * c_t + cfg.tf01 * s_t + cfg.tf03
+                var y_body = cfg.tf10 * c_t + cfg.tf11 * s_t + cfg.tf13
+                var dist_sq = x_body * x_body + y_body * y_body
+                var x_sq = x_body * x_body
+                var cone_sq = self.cos_sq_crit_angle * dist_sq
+                if x_body > F32(0.0) and x_sq >= cone_sq:
+                    host_fwd.append(Int32(i))
+                if x_body < F32(0.0) and x_sq >= cone_sq:
+                    host_bwd.append(Int32(i))
+
+            self.ctx.enqueue_copy(dst_buf=self.cos_angles, src_buf=host_cos)
+            self.ctx.enqueue_copy(dst_buf=self.sin_angles, src_buf=host_sin)
+
+            self.n_fwd = len(host_fwd)
+            self.n_bwd = len(host_bwd)
+
+            var fwd_alloc = self.n_fwd if self.n_fwd > 0 else 1
+            var bwd_alloc = self.n_bwd if self.n_bwd > 0 else 1
+            self.fwd_indices = self.ctx.enqueue_create_buffer[DType.int32](fwd_alloc)
+            self.bwd_indices = self.ctx.enqueue_create_buffer[DType.int32](bwd_alloc)
+
+            if self.n_fwd > 0:
+                var host_fwd_buf = self.ctx.enqueue_create_host_buffer[
+                    DType.int32
+                ](self.n_fwd)
+                var fwd_ptr = host_fwd_buf.unsafe_ptr().value()
+                for i in range(self.n_fwd):
+                    (fwd_ptr + i)[] = host_fwd[i]
+                self.ctx.enqueue_copy(
+                    dst_buf=self.fwd_indices, src_buf=host_fwd_buf,
+                )
+            if self.n_bwd > 0:
+                var host_bwd_buf = self.ctx.enqueue_create_host_buffer[
+                    DType.int32
+                ](self.n_bwd)
+                var bwd_ptr = host_bwd_buf.unsafe_ptr().value()
+                for i in range(self.n_bwd):
+                    (bwd_ptr + i)[] = host_bwd[i]
+                self.ctx.enqueue_copy(
+                    dst_buf=self.bwd_indices, src_buf=host_bwd_buf,
+                )
+        else:
+            # Pointcloud-only usage: allocate 1-element placeholders.
+            self.fwd_indices = self.ctx.enqueue_create_buffer[DType.int32](1)
+            self.bwd_indices = self.ctx.enqueue_create_buffer[DType.int32](1)
+
+        # Pointcloud raw-bytes buffer. Grown on demand
+        if max_cloud_bytes > 0:
+            self.raw_bytes = self.ctx.enqueue_create_buffer[DType.int8](
+                max_cloud_bytes,
+            )
+            self.raw_capacity = max_cloud_bytes
+        else:
+            self.raw_bytes = self.ctx.enqueue_create_buffer[DType.int8](1)
+            self.raw_capacity = 0
+
+        self.ctx.synchronize()
+
+
+@export
+def mojo_crit_zone_create(
+    scan_angles: UnsafePointer[Float64, MutExternalOrigin],
+    scan_size: Int32,
+    max_cloud_bytes: Int32,
+    cfg: UnsafePointer[MojoCritZoneConfig, MutExternalOrigin],
+) -> UnsafePointer[CritZoneHandle, MutExternalOrigin]:
+    try:
+        var p = alloc[CritZoneHandle](1)
+        p.init_pointee_move(
+            CritZoneHandle(
+                scan_angles, Int(scan_size), Int(max_cloud_bytes), cfg[0],
+            )
+        )
+        return p
+    except:
+        return UnsafePointer[CritZoneHandle, MutExternalOrigin]()
+
+
+@export
+def mojo_crit_zone_destroy(
+    handle: UnsafePointer[CritZoneHandle, MutExternalOrigin],
+):
+    if handle:
+        handle.destroy_pointee()
+        handle.free()
+
+
+@export
+def mojo_crit_zone_run_laserscan(
+    handle: UnsafePointer[CritZoneHandle, MutExternalOrigin],
+    host_ranges: UnsafePointer[F32, MutExternalOrigin],
+    forward: Int32,
+    out_factor: UnsafePointer[F32, MutExternalOrigin],
+) -> Int32:
+    if not handle:
+        return Int32(-1)
+    try:
+        _cz_run_laserscan_impl(handle, host_ranges, forward, out_factor)
+    except e:
+        print("mojo_crit_zone_run_laserscan error:", e)
+        return Int32(-2)
+    return Int32(0)
+
+
+def _cz_run_laserscan_impl(
+    handle: UnsafePointer[CritZoneHandle, MutExternalOrigin],
+    host_ranges: UnsafePointer[F32, MutExternalOrigin],
+    forward: Int32,
+    out_factor: UnsafePointer[F32, MutExternalOrigin],
+) raises:
+    ref h = handle[]
+    if h.scan_size <= 0:
+        raise Error("crit_zone run_laserscan: handle has no scan data")
+
+    # Reset out to min-identity.
+    h.out_factor.enqueue_fill(F32(1.0))
+
+    # Upload ranges (caller already converted to float).
+    h.ctx.enqueue_copy(dst_buf=h.ranges, src_ptr=host_ranges)
+
+    var use_forward = forward != Int32(0)
+    var n_items = h.n_fwd if use_forward else h.n_bwd
+    if n_items <= 0:
+        # No scan bins fall inside the requested cone; result stays 1.0.
+        h.ctx.enqueue_copy(dst_ptr=out_factor, src_buf=h.out_factor)
+        h.ctx.synchronize()
+        return
+
+    var idx_ptr = (
+        h.fwd_indices.unsafe_ptr() if use_forward else h.bwd_indices.unsafe_ptr()
+    )
+
+    h.ctx.enqueue_function[
+        critical_zone_laserscan_kernel, critical_zone_laserscan_kernel,
+    ](
+        h.ranges.unsafe_ptr(),
+        h.cos_angles.unsafe_ptr(),
+        h.sin_angles.unsafe_ptr(),
+        idx_ptr, n_items,
+        h.cfg.tf00, h.cfg.tf01, h.cfg.tf03,
+        h.cfg.tf10, h.cfg.tf11, h.cfg.tf13,
+        h.cfg.robot_radius, h.cfg.critical_distance,
+        h.dist_denom, h.safe_threshold_sq,
+        h.out_factor.unsafe_ptr(),
+        grid_dim=1, block_dim=WG_SIZE,
+    )
+
+    h.ctx.enqueue_copy(dst_ptr=out_factor, src_buf=h.out_factor)
+    h.ctx.synchronize()
+
+
+@export
+def mojo_crit_zone_run_pointcloud(
+    handle: UnsafePointer[CritZoneHandle, MutExternalOrigin],
+    host_bytes: UnsafePointer[Int8, MutExternalOrigin],
+    total_bytes: Int32,
+    point_step: Int32,
+    row_step: Int32,
+    height: Int32,
+    width: Int32,
+    x_offset: Int32,
+    y_offset: Int32,
+    z_offset: Int32,
+    forward: Int32,
+    out_factor: UnsafePointer[F32, MutExternalOrigin],
+) -> Int32:
+    if not handle:
+        return Int32(-1)
+    try:
+        _cz_run_pointcloud_impl(
+            handle, host_bytes, total_bytes,
+            point_step, row_step, height, width,
+            x_offset, y_offset, z_offset,
+            forward, out_factor,
+        )
+    except e:
+        print("mojo_crit_zone_run_pointcloud error:", e)
+        return Int32(-2)
+    return Int32(0)
+
+
+def _cz_run_pointcloud_impl(
+    handle: UnsafePointer[CritZoneHandle, MutExternalOrigin],
+    host_bytes: UnsafePointer[Int8, MutExternalOrigin],
+    total_bytes: Int32,
+    point_step: Int32,
+    row_step: Int32,
+    height: Int32,
+    width: Int32,
+    x_offset: Int32,
+    y_offset: Int32,
+    z_offset: Int32,
+    forward: Int32,
+    out_factor: UnsafePointer[F32, MutExternalOrigin],
+) raises:
+    ref h = handle[]
+    var tb = Int(total_bytes)
+    var h_i = Int(height)
+    var w_i = Int(width)
+    var num_points = h_i * w_i
+
+    h.out_factor.enqueue_fill(F32(1.0))
+
+    if tb == 0 or num_points == 0:
+        # Empty cloud
+        h.ctx.enqueue_copy(dst_ptr=out_factor, src_buf=h.out_factor)
+        h.ctx.synchronize()
+        return
+
+    # Grow raw-bytes buffer if the incoming scan is larger than current capacity
+    if h.raw_capacity < tb:
+        h.raw_bytes = h.ctx.enqueue_create_buffer[DType.int8](tb)
+        h.raw_capacity = tb
+
+    h.ctx.enqueue_copy(dst_buf=h.raw_bytes, src_ptr=host_bytes)
+
+    var is_contiguous = Int32(1) if Int(row_step) == w_i * Int(point_step) else Int32(0)
+    var num_blocks = ceildiv(num_points, WG_SIZE)
+
+    h.ctx.enqueue_function[
+        critical_zone_pointcloud_kernel, critical_zone_pointcloud_kernel,
+    ](
+        h.raw_bytes.unsafe_ptr(), tb, num_points,
+        Int(point_step), Int(row_step), w_i,
+        is_contiguous,
+        Int(x_offset), Int(y_offset), Int(z_offset),
+        h.cfg.min_height, h.cfg.max_height,
+        h.cfg.tf00, h.cfg.tf01, h.cfg.tf03,
+        h.cfg.tf10, h.cfg.tf11, h.cfg.tf13,
+        h.cos_sq_crit_angle,
+        h.cfg.robot_radius, h.cfg.critical_distance,
+        h.inv_dist_range, h.safe_threshold_sq,
+        forward,
+        h.out_factor.unsafe_ptr(),
+        grid_dim=num_blocks, block_dim=WG_SIZE,
+    )
+
+    h.ctx.enqueue_copy(dst_ptr=out_factor, src_buf=h.out_factor)
     h.ctx.synchronize()
