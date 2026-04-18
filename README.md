@@ -75,10 +75,12 @@ Benchmark names match kompass-core's suite exactly, so you can drop this file al
 
 | Benchmark                 | kompass-core (SYCL) | kompass-mojo (Mojo nightly) |
 | ------------------------- | ------------------- | --------------------------- |
-| `CostEvaluator_5k_Trajs`  | 16.358 ms (±0.12)   | 15.973 ms (±0.09)           |
-| `Mapper_Dense_400x400`    | 0.175 ms            | 0.297 ms                    |
-| `CriticalZone_Dense_Scan` | 0.146 ms            | 0.026 ms                    |
-| `CriticalZone_100k_Cloud` | 0.519 ms            | 0.331 ms                    |
+| `CostEvaluator_5k_Trajs`  | 16.640 ms           | 16.078 ms                   |
+| `Mapper_Dense_400x400`    | 0.247 ms            | 0.290 ms                    |
+| `CriticalZone_Dense_Scan` | 0.161 ms            | 0.022 ms                    |
+| `CriticalZone_100k_Cloud` | 0.508 ms            | 0.322 ms                    |
+
+Numbers are mean over 50 iterations.
 
 ## Relationship to kompass-core
 
