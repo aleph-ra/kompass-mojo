@@ -14,3 +14,4 @@ build = { cmd = "mkdir -p build && mojo build -I src --emit shared-lib -o build/
 build-harness = { cmd = "cmake -S integration -B integration/build -DCMAKE_BUILD_TYPE=Release && cmake --build integration/build --parallel", depends-on = ["build"] }
 benchmark = { cmd = "bash -c 'mkdir -p results && integration/build/kompass_benchmark_mojo ${PLATFORM:-gpu} results/${PLATFORM:-gpu}.json'", depends-on = ["build-harness"] }
 test = { cmd = "mojo run -I src tests/test_cost_evaluator.mojo" }
+test-mapper = { cmd = "mojo run -I src tests/test_local_mapper.mojo" }
