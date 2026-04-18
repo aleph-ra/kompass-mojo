@@ -82,6 +82,70 @@ int32_t mojo_local_mapper_run(MojoLocalMapperHandle handle,
 
 void mojo_local_mapper_destroy(MojoLocalMapperHandle handle);
 
+
+// ===========================================================================
+// Critical-zone checker FFI
+//
+// Two modes:
+// - laserscan: `scan_size > 0`; handle precomputes cos/sin + forward /
+//   backward cone index LUTs at create-time. `run_laserscan` is valid.
+// - pointcloud: `max_cloud_bytes > 0` to pre-allocate; otherwise the
+//   device raw-bytes buffer grows on first `run_pointcloud` call.
+//
+// Output is a single float in [0.0, 1.0]: 1.0 = safe, 0.0 = stop,
+// intermediate = slowdown factor.
+// ===========================================================================
+
+typedef struct MojoCritZoneConfig {
+  // 2D submatrix of the sensor→body Isometry3f (kernels drop Z).
+  float tf00;
+  float tf01;
+  float tf03;
+  float tf10;
+  float tf11;
+  float tf13;
+  // Safety geometry.
+  float robot_radius;
+  float critical_angle;      // half-angle in radians (must be <= pi/2)
+  float critical_distance;
+  float slowdown_distance;
+  // Z-filter bounds for the pointcloud path.
+  float min_height;
+  float max_height;
+} MojoCritZoneConfig;
+
+typedef void *MojoCritZoneHandle;
+
+// `scan_angles` is a host buffer of `scan_size` doubles (pass nullptr /
+// scan_size=0 for pointcloud-only use). `max_cloud_bytes` pre-allocates
+// the raw-bytes device buffer; set to 0 to defer allocation to the first
+// run_pointcloud call.
+MojoCritZoneHandle mojo_crit_zone_create(const double *scan_angles,
+                                          int32_t scan_size,
+                                          int32_t max_cloud_bytes,
+                                          const MojoCritZoneConfig *cfg);
+
+void mojo_crit_zone_destroy(MojoCritZoneHandle handle);
+
+// Laserscan-mode check. `host_ranges` is a float buffer of `scan_size`
+// entries (caller does the double→float narrowing). `forward=1` uses the
+// forward cone, `forward=0` the backward cone. `out_factor` receives the
+// resulting safety factor. Returns 0 on success, negative on error.
+int32_t mojo_crit_zone_run_laserscan(MojoCritZoneHandle handle,
+                                     const float *host_ranges,
+                                     int32_t forward, float *out_factor);
+
+// Pointcloud-mode check. Accepts raw PointCloud2 bytes + layout
+// descriptors. Only FLOAT32 x/y/z fields are supported
+// Returns 0 on success, negative on error.
+int32_t mojo_crit_zone_run_pointcloud(MojoCritZoneHandle handle,
+                                      const int8_t *host_bytes,
+                                      int32_t total_bytes, int32_t point_step,
+                                      int32_t row_step, int32_t height,
+                                      int32_t width, int32_t x_offset,
+                                      int32_t y_offset, int32_t z_offset,
+                                      int32_t forward, float *out_factor);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

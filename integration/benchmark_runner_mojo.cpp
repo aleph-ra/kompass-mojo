@@ -302,6 +302,110 @@ int main(int argc, char* argv[]) {
         mojo_local_mapper_destroy(mh);
     }
 
+    // =========================================================================
+    // TEST 3 & 4: CriticalZoneChecker (laserscan + pointcloud)
+    //
+    // Two harnesses read identical inputs:
+    //   cylinder robot, radius 0.51, sensor pos (0.22, 0, 0.4),
+    //   sensor rotation quaternion {0, 0, 0.99, 0} (normalised → 180° about
+    //   z → 2D submatrix tf00=-1, tf11=-1, translation (0.22, 0)),
+    //   critical_angle = 160° (halved to 80° = 1.396 rad),
+    //   crit_dist=0.3, slow_dist=0.6, min_h=0.1, max_h=2.0.
+    //
+    // Both benchmarks share one CZ handle.
+    // =========================================================================
+    {
+        MojoCritZoneConfig czcfg{};
+        czcfg.tf00 = -1.0f;
+        czcfg.tf01 =  0.0f;
+        czcfg.tf03 =  0.22f;
+        czcfg.tf10 =  0.0f;
+        czcfg.tf11 = -1.0f;
+        czcfg.tf13 =  0.0f;
+        czcfg.robot_radius = 0.51f;
+        czcfg.critical_angle = static_cast<float>(160.0 * M_PI / 180.0 / 2.0);
+        czcfg.critical_distance = 0.3f;
+        czcfg.slowdown_distance = 0.6f;
+        czcfg.min_height = 0.1f;
+        czcfg.max_height = 2.0f;
+
+        // ---- Laserscan input: 3600 angles, ranges tuned to slowdown zone ----
+        // R^2 + 0.44·cos(θ)·R - 0.8732 = 0 so every point lands at ~0.96 m
+        // distance from the body origin — inside the slowdown band [0.81, 1.11]
+        // between critical=0.3 and slow=0.6.
+        const int scan_points = 3600;
+        std::vector<double> cz_angles(scan_points);
+        std::vector<float>  cz_ranges(scan_points);
+        {
+            const double sx = 0.22;
+            const double r_target = 0.96;
+            const double c_const = sx * sx - r_target * r_target;  // -0.8732
+            for (int i = 0; i < scan_points; ++i) {
+                double theta = -M_PI + (2.0 * M_PI) * i / scan_points;
+                cz_angles[i] = theta;
+                double b = 2.0 * sx * std::cos(theta);
+                double disc = b * b - 4.0 * c_const;
+                double r = (-b + std::sqrt(disc)) * 0.5;
+                cz_ranges[i] = static_cast<float>(r);
+            }
+        }
+
+        // ---- Pointcloud input: 100k random PointXYZ (x,y in [-10,10), z in [0,3)) ----
+        // 16B/point, x/y/z float32 at 0/4/8.
+        const int pc_count = 100000;
+        const int pc_stride = 16;
+        std::vector<int8_t> cz_cloud(static_cast<size_t>(pc_count) * pc_stride);
+        {
+            std::srand(42);  // reproducible inputs
+            float* fp = reinterpret_cast<float*>(cz_cloud.data());
+            for (int i = 0; i < pc_count; ++i) {
+                fp[i * 4 + 0] = (std::rand() % 2000) / 100.0f - 10.0f;
+                fp[i * 4 + 1] = (std::rand() % 2000) / 100.0f - 10.0f;
+                fp[i * 4 + 2] = (std::rand() %  300) / 100.0f;
+                fp[i * 4 + 3] = 0.0f;
+            }
+        }
+        int pc_total_bytes = pc_count * pc_stride;
+
+        MojoCritZoneHandle czh = mojo_crit_zone_create(
+            cz_angles.data(), scan_points, pc_total_bytes, &czcfg);
+        if (!czh) {
+            LOG_ERROR("mojo_crit_zone_create returned null");
+            return 4;
+        }
+
+        // --- TEST 3: laserscan ---
+        float cz_scan_factor = 1.0f;
+        auto cz_scan_workload = [&]() {
+            int rc = mojo_crit_zone_run_laserscan(
+                czh, cz_ranges.data(), /*forward*/ 1, &cz_scan_factor);
+            if (rc != 0) {
+                LOG_ERROR("mojo_crit_zone_run_laserscan returned " << rc);
+            }
+        };
+        results.push_back(measure_performance("CriticalZone_Dense_Scan",
+                                              cz_scan_workload));
+        LOG_INFO("CriticalZone_Dense_Scan factor: " << cz_scan_factor);
+
+        // --- TEST 4: pointcloud ---
+        float cz_pc_factor = 1.0f;
+        auto cz_pc_workload = [&]() {
+            int rc = mojo_crit_zone_run_pointcloud(
+                czh, cz_cloud.data(), pc_total_bytes,
+                pc_stride, pc_stride * pc_count, 1, pc_count,
+                0, 4, 8,
+                /*forward*/ 1, &cz_pc_factor);
+            if (rc != 0) {
+                LOG_ERROR("mojo_crit_zone_run_pointcloud returned " << rc);
+            }
+        };
+        results.push_back(measure_performance("CriticalZone_100k_Cloud",
+                                              cz_pc_workload));
+        LOG_INFO("CriticalZone_100k_Cloud factor: " << cz_pc_factor);
+
+        mojo_crit_zone_destroy(czh);
+    }
+
     save_results_to_json(platform_alias, results, output_path);
     return 0;
 }
