@@ -159,7 +159,6 @@ def mojo_cost_eval_run(
     host_tracked_x: UnsafePointer[F32, MutExternalOrigin],
     host_tracked_y: UnsafePointer[F32, MutExternalOrigin],
     ref_path_size: Int32,
-    tracked_segment_length: F32,
     goal_x: F32,
     goal_y: F32,
     goal_path_length: F32,
@@ -178,7 +177,7 @@ def mojo_cost_eval_run(
             host_vel_vx, host_vel_vy, host_vel_omega,
             Int(trajs_size),
             host_tracked_x, host_tracked_y,
-            Int(ref_path_size), tracked_segment_length,
+            Int(ref_path_size),
             goal_x, goal_y, goal_path_length,
             host_obs_x, host_obs_y, Int(obs_size),
             out_min_cost, out_min_idx,
@@ -200,7 +199,6 @@ def _run_impl(
     host_tracked_x: UnsafePointer[F32, MutExternalOrigin],
     host_tracked_y: UnsafePointer[F32, MutExternalOrigin],
     ref_path_size: Int,
-    tracked_segment_length: F32,
     goal_x: F32,
     goal_y: F32,
     goal_path_length: F32,
@@ -249,14 +247,13 @@ def _run_impl(
 
     # 4. Reference path cost.
     if h.cfg.ref_path_weight > 0.0:
-        var inv_ref_length = F32(1.0) / tracked_segment_length if tracked_segment_length > 0.0 else F32(0.0)
-        var inv_ref_size_count = F32(1.0) / F32(ref_path_size) if ref_path_size > 0 else F32(0.0)
+        var inv_traj_size_count = F32(1.0) / F32(path_size) if path_size > 0 else F32(0.0)
         h.ctx.enqueue_function[ref_path_cost_kernel, ref_path_cost_kernel](
             paths_x_ptr, paths_y_ptr,
             tracked_x_ptr, tracked_y_ptr,
             costs_ptr,
             path_size, ref_path_size,
-            inv_ref_length, inv_ref_size_count,
+            inv_traj_size_count,
             h.cfg.ref_path_weight,
             grid_dim=trajs_size,
             block_dim=WG_SIZE,

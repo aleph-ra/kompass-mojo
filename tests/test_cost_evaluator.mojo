@@ -182,10 +182,10 @@ def test_ref_path_cost_kernel(ctx: DeviceContext) raises:
     """Two trajectories, 4 points. Ref path = 3 points along x = [0, 1, 2].
     Traj 0: x=[0, 1, 2, 3], y=0 (follows ref closely).
     Traj 1: x=[0, 1, 2, 3], y=1 (offset by 1 in y).
-    Traj 0 should have lower cost than traj 1.
-    For traj 1: min distance to each ref point is 1.0 (y offset).
-    avg_dist = 3 * 1.0 / 3 = 1.0. end_dist = sqrt(1+1)/ref_len = sqrt(2)/2.
-    final = weight * (avg + end) * 0.5 = (1.0 + 0.7071) * 0.5 = 0.8536
+    Cross-track error: for each traj point, min distance to any ref point,
+    averaged over the trajectory size.
+    Traj 0: distances per traj point = [0, 0, 0, 1]; avg = 1/4 = 0.25.
+    Traj 1: distances per traj point = [1, 1, 1, sqrt(2)]; avg ~ 1.1036.
     """
     comptime TRAJS = 2
     comptime PTS = 4
@@ -206,14 +206,12 @@ def test_ref_path_cost_kernel(ctx: DeviceContext) raises:
     costs.enqueue_fill(F32(0.0))
     ctx.synchronize()
 
-    var ref_length = Float32(2.0)  # distance from (0,0) to (2,0)
     ctx.enqueue_function[ref_path_cost_kernel, ref_path_cost_kernel](
         paths_x.unsafe_ptr(), paths_y.unsafe_ptr(),
         tracked_x.unsafe_ptr(), tracked_y.unsafe_ptr(),
         costs.unsafe_ptr(),
         PTS, REF,
-        F32(1.0 / ref_length),  # inv_ref_length
-        F32(1.0 / Float32(REF)),  # inv_ref_size_count
+        F32(1.0 / Float32(PTS)),  # inv_traj_size_count
         F32(1.0),  # cost_weight
         grid_dim=TRAJS,
         block_dim=WG_SIZE,
@@ -221,13 +219,11 @@ def test_ref_path_cost_kernel(ctx: DeviceContext) raises:
     ctx.synchronize()
 
     var result = _read_buffer(ctx, costs, TRAJS)
-    # Traj 0: ref points match on x-axis (distance 0 each), but endpoint (3,0)
-    # extends 1.0 past last ref point (2,0). end_dist = 1.0 * (1/2) = 0.5.
-    # final = weight * (0 + 0.5) * 0.5 = 0.25.
+    # Traj 0: sum of per-traj-point min distances = 0+0+0+1 = 1.0.
+    # avg = 1.0 / 4 = 0.25. final = 1.0 * 0.25 = 0.25.
     assert_almost_equal(result[0], 0.25, atol=0.01, msg="ref_path: traj 0")
-    # Traj 1: y=1 offset → min distance to each ref point is 1.0.
-    # avg = 1.0. end_dist = sqrt(2) * 0.5 ≈ 0.707. final = (1.0+0.707)*0.5 ≈ 0.854.
-    assert_almost_equal(result[1], 0.854, atol=0.02, msg="ref_path: traj 1")
+    # Traj 1: sum = 1+1+1+sqrt(2) ≈ 4.4142. avg = 4.4142/4 ≈ 1.1036.
+    assert_almost_equal(result[1], 1.1036, atol=0.02, msg="ref_path: traj 1")
     assert_true(result[0] < result[1], "ref_path: traj 0 should be < traj 1")
     print("  PASS: ref_path_cost_kernel (traj0=", result[0], "traj1=", result[1], ")")
 

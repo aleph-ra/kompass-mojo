@@ -193,12 +193,12 @@ def jerk_cost_kernel(
 # ---------------------------------------------------------------------------
 # 4. ref_path_cost_kernel
 #
-# SYCL: cost_evaluator_gpu.cpp:405-507 (refPathCostKernel)
-# One block per trajectory. Each thread handles one (or more, strided)
-# reference-path points; for each ref point it finds the closest trajectory
-# point using a shared-memory tile of trajectory positions, then the block
-# tree-reduces the sum of min-distances and thread 0 adds the end-point
-# distance and atomically writes the normalized cost.
+# SYCL: cost_evaluator_gpu.cpp:360-495 (refPathCostKernel)
+# Average cross-track error. One block per trajectory. Each thread handles
+# one (or more, strided) trajectory points; for each trajectory point it
+# finds the closest reference-path point using a shared-memory tile of
+# reference positions, then the block tree-reduces the sum of min-distances
+# and thread 0 atomically writes the cost normalized by trajectory size.
 # ---------------------------------------------------------------------------
 
 
@@ -208,19 +208,18 @@ def ref_path_cost_kernel(
     tracked_x: UnsafePointer[F32, MutAnyOrigin],
     tracked_y: UnsafePointer[F32, MutAnyOrigin],
     costs: UnsafePointer[F32, MutAnyOrigin],
-    path_size: Int,            # numPointsPerTrajectory_
-    ref_size: Int,             # tracked_segment_size
-    inv_ref_length: F32,       # 1 / tracked_segment_length
-    inv_ref_size_count: F32,   # 1 / refSize
+    path_size: Int,             # numPointsPerTrajectory_
+    ref_size: Int,              # tracked_segment_size
+    inv_traj_size_count: F32,   # 1 / pathSize
     cost_weight: F32,
 ):
     var traj_idx = Int(block_idx.x)
     var tid = Int(thread_idx.x)
 
-    var tile_tx = stack_allocation[
+    var tile_rx = stack_allocation[
         WG_SIZE, F32, address_space=AddressSpace.SHARED
     ]()
-    var tile_ty = stack_allocation[
+    var tile_ry = stack_allocation[
         WG_SIZE, F32, address_space=AddressSpace.SHARED
     ]()
     var partials = stack_allocation[
@@ -231,45 +230,45 @@ def ref_path_cost_kernel(
 
     # Align outer loop bound up to a multiple of WG_SIZE so all threads
     # participate in the tile loads/barriers each iter.
-    var aligned_ref_size = ((ref_size + WG_SIZE - 1) // WG_SIZE) * WG_SIZE
+    var aligned_path_size = ((path_size + WG_SIZE - 1) // WG_SIZE) * WG_SIZE
 
     var k = tid
-    while k < aligned_ref_size:
-        var valid_ref_point = k < ref_size
-        var rx: F32 = 0.0
-        var ry: F32 = 0.0
-        var r_min_dist_sq: F32 = F32_MAX
+    while k < aligned_path_size:
+        var valid_traj_point = k < path_size
+        var tx: F32 = 0.0
+        var ty: F32 = 0.0
+        var t_min_dist_sq: F32 = F32_MAX
 
-        if valid_ref_point:
-            rx = tracked_x[k]
-            ry = tracked_y[k]
+        if valid_traj_point:
+            var global_traj_idx = traj_idx * path_size + k
+            tx = paths_x[global_traj_idx]
+            ty = paths_y[global_traj_idx]
 
         var tile_base = 0
-        while tile_base < path_size:
-            var traj_pt_idx = tile_base + tid
-            if traj_pt_idx < path_size:
-                var global_traj_idx = traj_idx * path_size + traj_pt_idx
-                tile_tx[tid] = paths_x[global_traj_idx]
-                tile_ty[tid] = paths_y[global_traj_idx]
+        while tile_base < ref_size:
+            var ref_pt_idx = tile_base + tid
+            if ref_pt_idx < ref_size:
+                tile_rx[tid] = tracked_x[ref_pt_idx]
+                tile_ry[tid] = tracked_y[ref_pt_idx]
             else:
-                tile_tx[tid] = F32_INF
-                tile_ty[tid] = F32_INF
+                tile_rx[tid] = F32_INF
+                tile_ry[tid] = F32_INF
 
             barrier()
 
-            if valid_ref_point:
-                comptime for t in range(WG_SIZE):
-                    var dx = rx - tile_tx[t]
-                    var dy = ry - tile_ty[t]
+            if valid_traj_point:
+                comptime for r in range(WG_SIZE):
+                    var dx = tx - tile_rx[r]
+                    var dy = ty - tile_ry[r]
                     var d2 = dx * dx + dy * dy
-                    if d2 < r_min_dist_sq:
-                        r_min_dist_sq = d2
+                    if d2 < t_min_dist_sq:
+                        t_min_dist_sq = d2
 
             barrier()
             tile_base = tile_base + WG_SIZE
 
-        if valid_ref_point:
-            local_total_dist = local_total_dist + sqrt(r_min_dist_sq)
+        if valid_traj_point:
+            local_total_dist = local_total_dist + sqrt(t_min_dist_sq)
 
         k = k + WG_SIZE
 
@@ -283,15 +282,9 @@ def ref_path_cost_kernel(
 
     if tid == 0:
         var total_dist_sum = partials[0]
-        var avg_path_dist = total_dist_sum * inv_ref_size_count
+        var avg_path_dist = total_dist_sum * inv_traj_size_count
 
-        var last_traj_idx = traj_idx * path_size + (path_size - 1)
-        var last_ref_idx = ref_size - 1
-        var end_dx = paths_x[last_traj_idx] - tracked_x[last_ref_idx]
-        var end_dy = paths_y[last_traj_idx] - tracked_y[last_ref_idx]
-        var end_dist = sqrt(end_dx * end_dx + end_dy * end_dy) * inv_ref_length
-
-        var final_val = cost_weight * ((avg_path_dist + end_dist) * F32(0.5))
+        var final_val = cost_weight * avg_path_dist
         _ = Atomic.fetch_add(costs + traj_idx, final_val)
 
 

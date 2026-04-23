@@ -232,7 +232,7 @@ int main(int argc, char* argv[]) {
             samples.vel_vx.data(), samples.vel_vy.data(), samples.vel_omega.data(),
             samples.num_samples,
             ref_path.x.data(), ref_path.y.data(),
-            static_cast<int32_t>(ref_path.x.size()), ref_path.length,
+            static_cast<int32_t>(ref_path.x.size()),
             goal_x, goal_y, ref_path.length,
             nullptr, nullptr, 0,  // no obstacles
             &out_min_cost, &out_min_idx);
