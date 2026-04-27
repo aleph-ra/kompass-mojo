@@ -254,7 +254,7 @@ int main(int argc, char* argv[]) {
     mojo_cost_eval_destroy(handle);
 
     // =========================================================================
-    // TEST 2: LocalMapper
+    // TEST 2a: LocalMapper
     //
     // 400x400 grid at 0.05 m resolution. scan_size matches the generated scan
     // (3600 rays, all processed).
@@ -275,6 +275,10 @@ int main(int argc, char* argv[]) {
         mcfg.laserscan_pos_x = 0.0f;
         mcfg.laserscan_pos_y = 0.0f;
         mcfg.laserscan_pos_z = 0.0f;
+        // Pointcloud-only fields — laserscan path ignores these
+        mcfg.min_height = 0.1f;
+        mcfg.max_height = 2.0f;
+        mcfg.range_max = 20.0f;
 
         MojoLocalMapperHandle mh = mojo_local_mapper_create(
             rows, cols, scan_size, max_points_per_line, &mcfg);
@@ -303,6 +307,80 @@ int main(int argc, char* argv[]) {
         }
         LOG_INFO("Mapper: " << n_occupied << " OCCUPIED cells (out of "
                             << grid_out.size() << ")");
+
+        mojo_local_mapper_destroy(mh);
+    }
+
+    // =========================================================================
+    // TEST 2b: MAPPING (Point Cloud → occupancy grid)
+    //
+    // 100k synthetic cloud. Times the full
+    // pointcloud→laserscan + raycast pipeline end-to-end.
+    // =========================================================================
+    {
+        const int rows = 400;
+        const int cols = 400;
+        const float res = 0.05f;
+        const int scan_size = 3600;
+        const int max_points_per_line = 256;
+
+        MojoLocalMapperConfig mcfg{};
+        mcfg.resolution = res;
+        mcfg.laserscan_orientation = 0.0f;
+        mcfg.laserscan_pos_x = 0.0f;
+        mcfg.laserscan_pos_y = 0.0f;
+        mcfg.laserscan_pos_z = 0.0f;
+        mcfg.min_height = 0.1f;
+        mcfg.max_height = 2.0f;
+        mcfg.range_max = 20.0f;
+
+        MojoLocalMapperHandle mh = mojo_local_mapper_create(
+            rows, cols, scan_size, max_points_per_line, &mcfg);
+        if (!mh) {
+            LOG_ERROR("mojo_local_mapper_create returned null (pc)");
+            return 3;
+        }
+
+        // 100k random PointXYZ matching the CriticalZone benchmark below
+        // (16 B / point, x/y/z float32 at 0/4/8). Reproducible seed.
+        const int pc_count = 100000;
+        const int pc_stride = 16;
+        std::vector<int8_t> cloud(static_cast<size_t>(pc_count) * pc_stride);
+        {
+            std::srand(42);
+            float* fp = reinterpret_cast<float*>(cloud.data());
+            for (int i = 0; i < pc_count; ++i) {
+                fp[i * 4 + 0] = (std::rand() % 2000) / 100.0f - 10.0f;
+                fp[i * 4 + 1] = (std::rand() % 2000) / 100.0f - 10.0f;
+                fp[i * 4 + 2] = (std::rand() %  300) / 100.0f;
+                fp[i * 4 + 3] = 0.0f;
+            }
+        }
+        const int pc_total_bytes = pc_count * pc_stride;
+
+        std::vector<int32_t> grid_out(static_cast<size_t>(rows) * cols);
+
+        auto pc_map_workload = [&]() {
+            int rc = mojo_local_mapper_run_pointcloud(
+                mh, cloud.data(), pc_total_bytes,
+                pc_stride, pc_stride * pc_count,
+                /*height*/ 1, /*width*/ pc_count,
+                /*x_off*/ 0, /*y_off*/ 4, /*z_off*/ 8,
+                grid_out.data());
+            if (rc != 0) {
+                LOG_ERROR("mojo_local_mapper_run_pointcloud returned " << rc);
+            }
+        };
+
+        results.push_back(
+            measure_performance("Mapper_PointCloud_100k", pc_map_workload));
+
+        size_t n_occupied = 0;
+        for (int32_t v : grid_out) {
+            if (v == 100) ++n_occupied;
+        }
+        LOG_INFO("Mapper_PointCloud: " << n_occupied << " OCCUPIED cells (out of "
+                                       << grid_out.size() << ")");
 
         mojo_local_mapper_destroy(mh);
     }

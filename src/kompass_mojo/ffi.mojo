@@ -4,9 +4,9 @@
 # in integration/kompass_mojo.h — keep that file in sync with the @export
 # signatures below.
 
-from std.math import ceildiv, sqrt, cos, sin
+from std.math import ceildiv, sqrt, cos, sin, pi
 from std.memory import UnsafePointer, alloc
-from std.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 
 from kompass_mojo.cost_evaluator import (
     DTYPE,
@@ -22,6 +22,7 @@ from kompass_mojo.cost_evaluator import (
 )
 from kompass_mojo.local_mapper import (
     OCC_UNEXPLORED,
+    pointcloud_to_laserscan_kernel,
     scan_to_grid_kernel,
 )
 from kompass_mojo.critical_zone import (
@@ -381,14 +382,25 @@ struct MojoLocalMapperConfig(TrivialRegisterPassable):
     var laserscan_pos_x: F32
     var laserscan_pos_y: F32
     var laserscan_pos_z: F32   # unused by kernel, kept for parity with SYCL
+    # Pointcloud-only geometry (ignored by the laserscan path):
+    var min_height: F32
+    var max_height: F32        # set < 0 to disable the upper bound
+    var range_max: F32         # default fill for empty bins
 
 
 struct MapperHandle(Movable):
     var ctx: DeviceContext
     var grid: DeviceBuffer[DType.int32]
     var distances: DeviceBuffer[DType.float32]
-    var ranges: DeviceBuffer[DType.float64]
+    var ranges: DeviceBuffer[DType.float32]
     var angles: DeviceBuffer[DType.float64]
+    # Host-side staging buffer for the laserscan-input → device float32
+    # conversion. Allocated once at construction.
+    var ranges_host_f32: HostBuffer[DType.float32]
+    # Pointcloud raw-bytes device buffer, lazy-grown on first run_pointcloud
+    # call (matches kompass-core's m_devicePtrRawBytes / m_rawCapacity).
+    var raw_bytes: DeviceBuffer[DType.int8]
+    var raw_capacity: Int
 
     var rows: Int
     var cols: Int
@@ -431,8 +443,13 @@ struct MapperHandle(Movable):
         var cells = rows * cols
         self.grid = self.ctx.enqueue_create_buffer[DType.int32](cells)
         self.distances = self.ctx.enqueue_create_buffer[DType.float32](cells)
-        self.ranges = self.ctx.enqueue_create_buffer[DType.float64](scan_size)
+        self.ranges = self.ctx.enqueue_create_buffer[DType.float32](scan_size)
         self.angles = self.ctx.enqueue_create_buffer[DType.float64](scan_size)
+        # Host-pinned staging for double→float32 ranges conversion.
+        self.ranges_host_f32 = self.ctx.enqueue_create_host_buffer[DType.float32](scan_size)
+        # Defer raw-bytes allocation; only the pointcloud path needs it.
+        self.raw_bytes = self.ctx.enqueue_create_buffer[DType.int8](1)
+        self.raw_capacity = 0
 
         # Precompute per-cell distance from laserscan origin
         var host_dist = self.ctx.enqueue_create_host_buffer[DType.float32](cells)
@@ -447,6 +464,17 @@ struct MapperHandle(Movable):
                 var d2 = diff_x * diff_x + diff_y * diff_y + diff_z * diff_z
                 (dst + (i + j * rows))[] = sqrt(d2)
         self.ctx.enqueue_copy(dst_buf=self.distances, src_buf=host_dist)
+
+        # Pre-populate per-bin angles: i * (2*pi / scan_size). The
+        # pointcloud→laserscan kernel uses the same binning convention, and
+        # the laserscan path overwrites these per call (so this seed only
+        # matters for the pointcloud path).
+        var host_ang = self.ctx.enqueue_create_host_buffer[DType.float64](scan_size)
+        var ang_ptr = host_ang.unsafe_ptr().value()
+        var angle_step = (2.0 * Float64(pi)) / Float64(scan_size)
+        for k in range(scan_size):
+            (ang_ptr + k)[] = Float64(k) * angle_step
+        self.ctx.enqueue_copy(dst_buf=self.angles, src_buf=host_ang)
         self.ctx.synchronize()
 
 
@@ -511,9 +539,14 @@ def _mapper_run_impl(
     # 1. Reset grid to UNEXPLORED (matches m_q.fill in scanToGrid).
     h.ctx.enqueue_memset(h.grid, OCC_UNEXPLORED)
 
-    # 2. H->D: angles and ranges.
+    # 2. H->D: angles + double→float32-converted ranges (matches
+    # kompass-core's m_hostFloatRanges staging, atomic_min on float32 is
+    # cheaper than float64 on most GPUs).
     h.ctx.enqueue_copy(dst_buf=h.angles, src_ptr=host_angles)
-    h.ctx.enqueue_copy(dst_buf=h.ranges, src_ptr=host_ranges)
+    var ranges_f32_ptr = h.ranges_host_f32.unsafe_ptr().value()
+    for i in range(h.scan_size):
+        (ranges_f32_ptr + i)[] = Float32(host_ranges[i])
+    h.ctx.enqueue_copy(dst_buf=h.ranges, src_buf=h.ranges_host_f32)
 
     # 3. Launch.
     h.ctx.enqueue_function[scan_to_grid_kernel, scan_to_grid_kernel](
@@ -533,6 +566,116 @@ def _mapper_run_impl(
     )
 
     # 4. D->H grid.
+    h.ctx.enqueue_copy(dst_ptr=host_grid_out, src_buf=h.grid)
+    h.ctx.synchronize()
+
+
+@export
+def mojo_local_mapper_run_pointcloud(
+    handle: UnsafePointer[MapperHandle, MutExternalOrigin],
+    host_bytes: UnsafePointer[Int8, MutExternalOrigin],
+    total_bytes: Int32,
+    point_step: Int32,
+    row_step: Int32,
+    height: Int32,
+    width: Int32,
+    x_offset: Int32,
+    y_offset: Int32,
+    z_offset: Int32,
+    host_grid_out: UnsafePointer[Int32, MutExternalOrigin],
+) -> Int32:
+    if not handle:
+        return Int32(-1)
+    try:
+        _mapper_run_pointcloud_impl(
+            handle, host_bytes, total_bytes, point_step, row_step,
+            height, width, x_offset, y_offset, z_offset, host_grid_out,
+        )
+    except e:
+        print("mojo_local_mapper_run_pointcloud error:", e)
+        return Int32(-2)
+    return Int32(0)
+
+
+def _mapper_run_pointcloud_impl(
+    handle: UnsafePointer[MapperHandle, MutExternalOrigin],
+    host_bytes: UnsafePointer[Int8, MutExternalOrigin],
+    total_bytes: Int32,
+    point_step: Int32,
+    row_step: Int32,
+    height: Int32,
+    width: Int32,
+    x_offset: Int32,
+    y_offset: Int32,
+    z_offset: Int32,
+    host_grid_out: UnsafePointer[Int32, MutExternalOrigin],
+) raises:
+    ref h = handle[]
+    var tb = Int(total_bytes)
+    var h_i = Int(height)
+    var w_i = Int(width)
+    var num_points = h_i * w_i
+
+    # 1. Reset grid to UNEXPLORED.
+    h.ctx.enqueue_memset(h.grid, OCC_UNEXPLORED)
+
+    # Empty cloud → grid stays all-UNEXPLORED, no work to do.
+    if tb == 0 or num_points == 0:
+        h.ctx.enqueue_copy(dst_ptr=host_grid_out, src_buf=h.grid)
+        h.ctx.synchronize()
+        return
+
+    # 2. Pre-fill ranges with range_max so empty bins read back as max range.
+    h.ranges.enqueue_fill(h.cfg.range_max)
+
+    # 3. Grow raw-bytes buffer if cloud exceeds current capacity (lazy
+    # allocation matches kompass-core's m_devicePtrRawBytes / m_rawCapacity).
+    if h.raw_capacity < tb:
+        h.raw_bytes = h.ctx.enqueue_create_buffer[DType.int8](tb)
+        h.raw_capacity = tb
+
+    h.ctx.enqueue_copy(dst_buf=h.raw_bytes, src_ptr=host_bytes)
+
+    var is_contiguous = Int32(1) if Int(row_step) == w_i * Int(point_step) else Int32(0)
+    var max_z_enabled = Int32(1) if h.cfg.max_height >= F32(0.0) else Int32(0)
+    var inv_two_pi_times_bins = F32(h.scan_size) / (F32(2.0) * F32(pi))
+    var num_blocks = ceildiv(num_points, h.max_points_per_line)
+
+    # 4. Pointcloud → laserscan: writes per-bin minimum distance into ranges.
+    h.ctx.enqueue_function[
+        pointcloud_to_laserscan_kernel, pointcloud_to_laserscan_kernel,
+    ](
+        h.raw_bytes.unsafe_ptr(), tb, num_points,
+        Int(point_step), Int(row_step), w_i,
+        is_contiguous,
+        Int(x_offset), Int(y_offset), Int(z_offset),
+        h.cfg.min_height, h.cfg.max_height, max_z_enabled,
+        h.scan_size, inv_two_pi_times_bins,
+        h.ranges.unsafe_ptr(),
+        grid_dim=num_blocks, block_dim=h.max_points_per_line,
+    )
+
+    # 5. Raycast laserscan → grid (same kernel as the laserscan path; the
+    # angles buffer must already hold per-bin ray angles, uploaded once at
+    # construction by the caller via mojo_local_mapper_set_angles or once
+    # before the first run).
+    h.ctx.enqueue_function[scan_to_grid_kernel, scan_to_grid_kernel](
+        h.ranges.unsafe_ptr(),
+        h.angles.unsafe_ptr(),
+        h.grid.unsafe_ptr(),
+        h.distances.unsafe_ptr(),
+        h.rows, h.cols,
+        h.cfg.resolution,
+        h.cfg.laserscan_orientation,
+        h.cfg.laserscan_pos_x,
+        h.cfg.laserscan_pos_y,
+        h.central_x, h.central_y,
+        h.start_x, h.start_y,
+        grid_dim=h.scan_size,
+        block_dim=h.max_points_per_line,
+    )
+
+    # 6. D->H grid.
     h.ctx.enqueue_copy(dst_ptr=host_grid_out, src_buf=h.grid)
     h.ctx.synchronize()
 

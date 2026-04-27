@@ -67,6 +67,10 @@ typedef struct MojoLocalMapperConfig {
   float laserscan_pos_x;
   float laserscan_pos_y;
   float laserscan_pos_z; // carried for parity, unused by the kernel
+  // Pointcloud-only (ignored by the laserscan run path):
+  float min_height; // cull points below this z in sensor frame.
+  float max_height; // upper cull bound; set < 0 to disable.
+  float range_max;  // default fill for empty angular bins (metres).
 } MojoLocalMapperConfig;
 
 typedef void *MojoLocalMapperHandle;
@@ -83,6 +87,22 @@ int32_t mojo_local_mapper_run(MojoLocalMapperHandle handle,
                               const double *host_angles,
                               const double *host_ranges,
                               int32_t *host_grid_out);
+
+// PointCloud2 variant: raw bytes + layout descriptors. The kernel
+// converts the cloud to a per-angular-bin minimum range on device (via
+// pointcloud_to_laserscan_kernel), then runs the same raycast as
+// mojo_local_mapper_run. Only FLOAT32 x/y/z fields are supported. The
+// angles consumed by the raycast use the bin convention
+// `angle[i] = i * 2*pi / scan_size` and are pre-uploaded at create time.
+// Returns 0 on success, negative on error.
+int32_t mojo_local_mapper_run_pointcloud(MojoLocalMapperHandle handle,
+                                         const int8_t *host_bytes,
+                                         int32_t total_bytes,
+                                         int32_t point_step, int32_t row_step,
+                                         int32_t height, int32_t width,
+                                         int32_t x_offset, int32_t y_offset,
+                                         int32_t z_offset,
+                                         int32_t *host_grid_out);
 
 void mojo_local_mapper_destroy(MojoLocalMapperHandle handle);
 
