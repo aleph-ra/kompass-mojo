@@ -36,13 +36,18 @@ MojoCostEvalHandle mojo_cost_eval_create(int32_t max_trajs,
 
 // Returns 0 on success, negative on error.
 //
+// `host_tracked_acc` must point at `ref_path_size` floats: the absolute
+// prefix arc lengths on the FULL reference path at each tracked-segment
+// index (i.e. the value of `accumulated_path_length_[start_idx + i]`.
+// Only consumed when goal_weight > 0; pass nullptr otherwise.
 int32_t mojo_cost_eval_run(MojoCostEvalHandle handle, const float *host_paths_x,
                            const float *host_paths_y, const float *host_vel_vx,
                            const float *host_vel_vy,
                            const float *host_vel_omega, int32_t trajs_size,
                            const float *host_tracked_x,
-                           const float *host_tracked_y, int32_t ref_path_size,
-                           float goal_x, float goal_y, float goal_path_length,
+                           const float *host_tracked_y,
+                           const float *host_tracked_acc, int32_t ref_path_size,
+                           float tracked_segment_length, float ref_path_length,
                            const float *host_obs_x, const float *host_obs_y,
                            int32_t obs_size, float *out_min_cost,
                            int32_t *out_min_idx);
@@ -81,7 +86,6 @@ int32_t mojo_local_mapper_run(MojoLocalMapperHandle handle,
 
 void mojo_local_mapper_destroy(MojoLocalMapperHandle handle);
 
-
 // ===========================================================================
 // Critical-zone checker FFI
 //
@@ -105,7 +109,7 @@ typedef struct MojoCritZoneConfig {
   float tf13;
   // Safety geometry.
   float robot_radius;
-  float critical_angle;      // half-angle in radians (must be <= pi/2)
+  float critical_angle; // half-angle in radians (must be <= pi/2)
   float critical_distance;
   float slowdown_distance;
   // Z-filter bounds for the pointcloud path.
@@ -120,9 +124,9 @@ typedef void *MojoCritZoneHandle;
 // the raw-bytes device buffer; set to 0 to defer allocation to the first
 // run_pointcloud call.
 MojoCritZoneHandle mojo_crit_zone_create(const double *scan_angles,
-                                          int32_t scan_size,
-                                          int32_t max_cloud_bytes,
-                                          const MojoCritZoneConfig *cfg);
+                                         int32_t scan_size,
+                                         int32_t max_cloud_bytes,
+                                         const MojoCritZoneConfig *cfg);
 
 void mojo_crit_zone_destroy(MojoCritZoneHandle handle);
 
@@ -131,8 +135,8 @@ void mojo_crit_zone_destroy(MojoCritZoneHandle handle);
 // forward cone, `forward=0` the backward cone. `out_factor` receives the
 // resulting safety factor. Returns 0 on success, negative on error.
 int32_t mojo_crit_zone_run_laserscan(MojoCritZoneHandle handle,
-                                     const float *host_ranges,
-                                     int32_t forward, float *out_factor);
+                                     const float *host_ranges, int32_t forward,
+                                     float *out_factor);
 
 // Pointcloud-mode check. Accepts raw PointCloud2 bytes + layout
 // descriptors. Only FLOAT32 x/y/z fields are supported

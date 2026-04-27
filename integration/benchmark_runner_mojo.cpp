@@ -124,6 +124,8 @@ static FlatTrajectorySamples generate_heavy_trajectory_samples_flat(
 struct FlatRefPath {
     std::vector<float> x;
     std::vector<float> y;
+    // Absolute prefix arc lengths on the full reference path (one per point).
+    std::vector<float> acc;
     float length;
 };
 
@@ -156,9 +158,13 @@ static FlatRefPath generate_ref_path_flat() {
     int n = 1001;
     r.x.reserve(n);
     r.y.reserve(n);
+    r.acc.reserve(n);
     for (int i = 0; i < n; ++i) {
         r.x.push_back(static_cast<float>(i * 0.01));
         r.y.push_back(0.0f);
+        // Straight path interpolated at 0.01 m -> prefix arc length per
+        // index is exactly i * 0.01.
+        r.acc.push_back(static_cast<float>(i * 0.01));
     }
     r.length = static_cast<float>((n - 1) * 0.01);  // 10.0 m
     return r;
@@ -223,17 +229,16 @@ int main(int argc, char* argv[]) {
     // --- Workload ---
     float out_min_cost = 0.0f;
     int32_t out_min_idx = -1;
-    float goal_x = ref_path.x.empty() ? 0.0f : ref_path.x.back();
-    float goal_y = ref_path.y.empty() ? 0.0f : ref_path.y.back();
     auto workload = [&]() {
         int rc = mojo_cost_eval_run(
             handle,
             samples.paths_x.data(), samples.paths_y.data(),
             samples.vel_vx.data(), samples.vel_vy.data(), samples.vel_omega.data(),
             samples.num_samples,
-            ref_path.x.data(), ref_path.y.data(),
+            ref_path.x.data(), ref_path.y.data(), ref_path.acc.data(),
             static_cast<int32_t>(ref_path.x.size()),
-            goal_x, goal_y, ref_path.length,
+            ref_path.length,  // tracked_segment_length
+            ref_path.length,  // ref_path_length
             nullptr, nullptr, 0,  // no obstacles
             &out_min_cost, &out_min_idx);
         if (rc != 0) {

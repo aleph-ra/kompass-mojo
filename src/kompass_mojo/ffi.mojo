@@ -63,6 +63,7 @@ struct CostEvalHandle(Movable):
     var vel_omega: DeviceBuffer[DTYPE]
     var tracked_x: DeviceBuffer[DTYPE]
     var tracked_y: DeviceBuffer[DTYPE]
+    var tracked_acc: DeviceBuffer[DTYPE]
     var obstacles_x: DeviceBuffer[DTYPE]
     var obstacles_y: DeviceBuffer[DTYPE]
     var costs: DeviceBuffer[DTYPE]
@@ -104,6 +105,7 @@ struct CostEvalHandle(Movable):
         self.vel_omega = self.ctx.enqueue_create_buffer[DTYPE](vel_n)
         self.tracked_x = self.ctx.enqueue_create_buffer[DTYPE](max_ref)
         self.tracked_y = self.ctx.enqueue_create_buffer[DTYPE](max_ref)
+        self.tracked_acc = self.ctx.enqueue_create_buffer[DTYPE](max_ref)
         self.obstacles_x = self.ctx.enqueue_create_buffer[DTYPE](max_obs)
         self.obstacles_y = self.ctx.enqueue_create_buffer[DTYPE](max_obs)
         self.costs = self.ctx.enqueue_create_buffer[DTYPE](max_trajs)
@@ -158,10 +160,10 @@ def mojo_cost_eval_run(
     trajs_size: Int32,
     host_tracked_x: UnsafePointer[F32, MutExternalOrigin],
     host_tracked_y: UnsafePointer[F32, MutExternalOrigin],
+    host_tracked_acc: UnsafePointer[F32, MutExternalOrigin],
     ref_path_size: Int32,
-    goal_x: F32,
-    goal_y: F32,
-    goal_path_length: F32,
+    tracked_segment_length: F32,
+    ref_path_length: F32,
     host_obs_x: UnsafePointer[F32, MutExternalOrigin],
     host_obs_y: UnsafePointer[F32, MutExternalOrigin],
     obs_size: Int32,
@@ -176,9 +178,9 @@ def mojo_cost_eval_run(
             host_paths_x, host_paths_y,
             host_vel_vx, host_vel_vy, host_vel_omega,
             Int(trajs_size),
-            host_tracked_x, host_tracked_y,
-            Int(ref_path_size),
-            goal_x, goal_y, goal_path_length,
+            host_tracked_x, host_tracked_y, host_tracked_acc,
+            Int(ref_path_size), tracked_segment_length,
+            ref_path_length,
             host_obs_x, host_obs_y, Int(obs_size),
             out_min_cost, out_min_idx,
         )
@@ -198,10 +200,10 @@ def _run_impl(
     trajs_size: Int,
     host_tracked_x: UnsafePointer[F32, MutExternalOrigin],
     host_tracked_y: UnsafePointer[F32, MutExternalOrigin],
+    host_tracked_acc: UnsafePointer[F32, MutExternalOrigin],
     ref_path_size: Int,
-    goal_x: F32,
-    goal_y: F32,
-    goal_path_length: F32,
+    tracked_segment_length: F32,
+    ref_path_length: F32,
     host_obs_x: UnsafePointer[F32, MutExternalOrigin],
     host_obs_y: UnsafePointer[F32, MutExternalOrigin],
     obs_size: Int,
@@ -225,6 +227,8 @@ def _run_impl(
     _memcpy_h2d(h.ctx, h.vel_omega, host_vel_omega, vel_n)
     _memcpy_h2d(h.ctx, h.tracked_x, host_tracked_x, ref_path_size)
     _memcpy_h2d(h.ctx, h.tracked_y, host_tracked_y, ref_path_size)
+    if h.cfg.goal_weight > 0.0:
+        _memcpy_h2d(h.ctx, h.tracked_acc, host_tracked_acc, ref_path_size)
     if obs_size > 0:
         _memcpy_h2d(h.ctx, h.obstacles_x, host_obs_x, obs_size)
         _memcpy_h2d(h.ctx, h.obstacles_y, host_obs_y, obs_size)
@@ -237,6 +241,7 @@ def _run_impl(
     var vel_omega_ptr = h.vel_omega.unsafe_ptr()
     var tracked_x_ptr = h.tracked_x.unsafe_ptr()
     var tracked_y_ptr = h.tracked_y.unsafe_ptr()
+    var tracked_acc_ptr = h.tracked_acc.unsafe_ptr()
     var obs_x_ptr = h.obstacles_x.unsafe_ptr()
     var obs_y_ptr = h.obstacles_y.unsafe_ptr()
     var costs_ptr = h.costs.unsafe_ptr()
@@ -248,27 +253,29 @@ def _run_impl(
     # 4. Reference path cost.
     if h.cfg.ref_path_weight > 0.0:
         var inv_traj_size_count = F32(1.0) / F32(path_size) if path_size > 0 else F32(0.0)
+        var inv_segment_length = F32(1.0) / tracked_segment_length if tracked_segment_length > 0.0 else F32(0.0)
         h.ctx.enqueue_function[ref_path_cost_kernel, ref_path_cost_kernel](
             paths_x_ptr, paths_y_ptr,
             tracked_x_ptr, tracked_y_ptr,
             costs_ptr,
             path_size, ref_path_size,
-            inv_traj_size_count,
+            inv_traj_size_count, inv_segment_length,
             h.cfg.ref_path_weight,
             grid_dim=trajs_size,
             block_dim=WG_SIZE,
         )
 
-    # 5. Goal distance cost. Uses the explicit goal passed in — SYCL uses the
-    # FULL reference path's end point, not the tracked segment's end point.
+    # 5. Goal distance cost. Distance-along-path: argmin over tracked segment
+    # gives closest absolute prefix arc length on the full reference path.
     if h.cfg.goal_weight > 0.0:
-        var inv_goal_length = F32(1.0) / goal_path_length if goal_path_length > 0.0 else F32(0.0)
-        var padded = ceildiv(trajs_size, WG_SIZE) * WG_SIZE
+        var inv_path_length = F32(1.0) / ref_path_length if ref_path_length > 0.0 else F32(0.0)
         h.ctx.enqueue_function[goal_cost_kernel, goal_cost_kernel](
-            paths_x_ptr, paths_y_ptr, costs_ptr,
-            trajs_size, path_size,
-            goal_x, goal_y, inv_goal_length, h.cfg.goal_weight,
-            grid_dim=padded // WG_SIZE,
+            paths_x_ptr, paths_y_ptr,
+            tracked_x_ptr, tracked_y_ptr, tracked_acc_ptr,
+            costs_ptr,
+            path_size, ref_path_size,
+            ref_path_length, inv_path_length, h.cfg.goal_weight,
+            grid_dim=trajs_size,
             block_dim=WG_SIZE,
         )
 

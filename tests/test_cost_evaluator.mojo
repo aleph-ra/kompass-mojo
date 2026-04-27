@@ -60,41 +60,101 @@ def _read_buffer(
 
 
 def test_goal_cost_kernel(ctx: DeviceContext) raises:
-    """Two trajectories, 4 points each. Goal at (4, 0), path_length = 4.
-    Traj 0 endpoint: (3, 0) -> distance 1.0, cost = 1.0 * (1.0 / 4.0) = 0.25
-    Traj 1 endpoint: (1, 0) -> distance 3.0, cost = 1.0 * (3.0 / 4.0) = 0.75
+    """Distance-along-path goal cost.
+    Tracked segment is a 5-point straight line at x=[0,1,2,3,4], y=0; the
+    full ref path extends to x=10, length 10.
+    Traj 0 endpoint (4, 0): closest seg point = idx 4, acc = 4.
+        arc_remaining_normalized = (10 - 4) / 10 = 0.6
+        tie_breaker = 0 / 10 = 0
+        cost = 1.0 * (0.6 + 0) = 0.6
+    Traj 1 endpoint (1, 0): closest = idx 1, acc = 1.
+        arc_remaining_normalized = 0.9, tie_breaker = 0. cost = 0.9.
     """
     comptime TRAJS = 2
     comptime PTS = 4
+    comptime SEG = 5
     comptime N = TRAJS * PTS
 
     var paths_x = ctx.enqueue_create_buffer[DTYPE](N)
     var paths_y = ctx.enqueue_create_buffer[DTYPE](N)
+    var tracked_x = ctx.enqueue_create_buffer[DTYPE](SEG)
+    var tracked_y = ctx.enqueue_create_buffer[DTYPE](SEG)
+    var tracked_acc = ctx.enqueue_create_buffer[DTYPE](SEG)
     var costs = ctx.enqueue_create_buffer[DTYPE](TRAJS)
 
-    # Traj 0: x=[0, 1, 2, 3], y=[0, 0, 0, 0]
-    # Traj 1: x=[0, 0.5, 0.8, 1], y=[0, 0, 0, 0]
-    _fill_buffer(ctx, paths_x, [0.0, 1.0, 2.0, 3.0, 0.0, 0.5, 0.8, 1.0])
+    # Traj 0 endpoint = (4, 0)  Traj 1 endpoint = (1, 0)
+    _fill_buffer(ctx, paths_x, [0.0, 1.0, 2.0, 4.0, 0.0, 0.5, 0.8, 1.0])
     _fill_buffer(ctx, paths_y, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    _fill_buffer(ctx, tracked_x, [0.0, 1.0, 2.0, 3.0, 4.0])
+    _fill_buffer(ctx, tracked_y, [0.0, 0.0, 0.0, 0.0, 0.0])
+    _fill_buffer(ctx, tracked_acc, [0.0, 1.0, 2.0, 3.0, 4.0])
     costs.enqueue_fill(F32(0.0))
     ctx.synchronize()
 
-    var padded = ceildiv(TRAJS, WG_SIZE) * WG_SIZE
+    var ref_path_length = Float32(10.0)
     ctx.enqueue_function[goal_cost_kernel, goal_cost_kernel](
-        paths_x.unsafe_ptr(), paths_y.unsafe_ptr(), costs.unsafe_ptr(),
-        TRAJS, PTS,
-        F32(4.0), F32(0.0),  # goal_x, goal_y
-        F32(1.0 / 4.0),      # inv_path_length
-        F32(1.0),             # cost_weight
-        grid_dim=padded // WG_SIZE,
+        paths_x.unsafe_ptr(), paths_y.unsafe_ptr(),
+        tracked_x.unsafe_ptr(), tracked_y.unsafe_ptr(), tracked_acc.unsafe_ptr(),
+        costs.unsafe_ptr(),
+        PTS, SEG,
+        F32(ref_path_length), F32(1.0 / ref_path_length),
+        F32(1.0),
+        grid_dim=TRAJS,
         block_dim=WG_SIZE,
     )
     ctx.synchronize()
 
     var result = _read_buffer(ctx, costs, TRAJS)
-    assert_almost_equal(result[0], 0.25, atol=1e-5, msg="goal: traj 0")
-    assert_almost_equal(result[1], 0.75, atol=1e-5, msg="goal: traj 1")
-    print("  PASS: goal_cost_kernel")
+    assert_almost_equal(result[0], 0.6, atol=1e-5, msg="goal: traj 0")
+    assert_almost_equal(result[1], 0.9, atol=1e-5, msg="goal: traj 1")
+    print("  PASS: goal_cost_kernel (traj0=", result[0], "traj1=", result[1], ")")
+
+
+def test_goal_cost_tie_breaker(ctx: DeviceContext) raises:
+    """Two trajectories with the same closest-segment index but different
+    lateral offsets: arc_remaining_normalized is identical; only the
+    tie-breaker (sqrt(min_dist_sq) / ref_path_length) differs.
+    Both endpoints at x=4 -> closest acc = 4, arc_remaining_normalized = 0.6.
+    A: y=0.1 -> tie_breaker = 0.1 / 10 = 0.01 -> cost = 0.61.
+    B: y=0.5 -> tie_breaker = 0.5 / 10 = 0.05 -> cost = 0.65.
+    """
+    comptime TRAJS = 2
+    comptime PTS = 4
+    comptime SEG = 5
+
+    var paths_x = ctx.enqueue_create_buffer[DTYPE](TRAJS * PTS)
+    var paths_y = ctx.enqueue_create_buffer[DTYPE](TRAJS * PTS)
+    var tracked_x = ctx.enqueue_create_buffer[DTYPE](SEG)
+    var tracked_y = ctx.enqueue_create_buffer[DTYPE](SEG)
+    var tracked_acc = ctx.enqueue_create_buffer[DTYPE](SEG)
+    var costs = ctx.enqueue_create_buffer[DTYPE](TRAJS)
+
+    _fill_buffer(ctx, paths_x, [0.0, 1.0, 2.0, 4.0, 0.0, 1.0, 2.0, 4.0])
+    _fill_buffer(ctx, paths_y, [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.5])
+    _fill_buffer(ctx, tracked_x, [0.0, 1.0, 2.0, 3.0, 4.0])
+    _fill_buffer(ctx, tracked_y, [0.0, 0.0, 0.0, 0.0, 0.0])
+    _fill_buffer(ctx, tracked_acc, [0.0, 1.0, 2.0, 3.0, 4.0])
+    costs.enqueue_fill(F32(0.0))
+    ctx.synchronize()
+
+    var ref_path_length = Float32(10.0)
+    ctx.enqueue_function[goal_cost_kernel, goal_cost_kernel](
+        paths_x.unsafe_ptr(), paths_y.unsafe_ptr(),
+        tracked_x.unsafe_ptr(), tracked_y.unsafe_ptr(), tracked_acc.unsafe_ptr(),
+        costs.unsafe_ptr(),
+        PTS, SEG,
+        F32(ref_path_length), F32(1.0 / ref_path_length),
+        F32(1.0),
+        grid_dim=TRAJS,
+        block_dim=WG_SIZE,
+    )
+    ctx.synchronize()
+
+    var result = _read_buffer(ctx, costs, TRAJS)
+    assert_almost_equal(result[0], 0.61, atol=1e-5, msg="goal tie: A")
+    assert_almost_equal(result[1], 0.65, atol=1e-5, msg="goal tie: B")
+    assert_true(result[0] < result[1], "tie: A should be < B")
+    print("  PASS: goal_cost_tie_breaker (A=", result[0], "B=", result[1], ")")
 
 
 def test_smoothness_cost_kernel(ctx: DeviceContext) raises:
@@ -182,10 +242,13 @@ def test_ref_path_cost_kernel(ctx: DeviceContext) raises:
     """Two trajectories, 4 points. Ref path = 3 points along x = [0, 1, 2].
     Traj 0: x=[0, 1, 2, 3], y=0 (follows ref closely).
     Traj 1: x=[0, 1, 2, 3], y=1 (offset by 1 in y).
-    Cross-track error: for each traj point, min distance to any ref point,
-    averaged over the trajectory size.
-    Traj 0: distances per traj point = [0, 0, 0, 1]; avg = 1/4 = 0.25.
-    Traj 1: distances per traj point = [1, 1, 1, sqrt(2)]; avg ~ 1.1036.
+    Cost = weight * (avg_cross_track + end_dist/segment_length) * 0.5.
+    Traj 0: cross-track dists = [0, 0, 0, 1]; avg = 0.25.
+            end_dist = dist((3,0),(2,0)) = 1.0; normalized = 1.0/2 = 0.5.
+            final = (0.25 + 0.5) * 0.5 = 0.375.
+    Traj 1: cross-track dists = [1, 1, 1, sqrt(2)]; avg ~ 1.1036.
+            end_dist = dist((3,1),(2,0)) = sqrt(2); normalized ~ 0.7071.
+            final = (1.1036 + 0.7071) * 0.5 ~ 0.9054.
     """
     comptime TRAJS = 2
     comptime PTS = 4
@@ -206,12 +269,14 @@ def test_ref_path_cost_kernel(ctx: DeviceContext) raises:
     costs.enqueue_fill(F32(0.0))
     ctx.synchronize()
 
+    var segment_length = Float32(2.0)  # (0,0)->(1,0)->(2,0)
     ctx.enqueue_function[ref_path_cost_kernel, ref_path_cost_kernel](
         paths_x.unsafe_ptr(), paths_y.unsafe_ptr(),
         tracked_x.unsafe_ptr(), tracked_y.unsafe_ptr(),
         costs.unsafe_ptr(),
         PTS, REF,
         F32(1.0 / Float32(PTS)),  # inv_traj_size_count
+        F32(1.0 / segment_length),  # inv_segment_length
         F32(1.0),  # cost_weight
         grid_dim=TRAJS,
         block_dim=WG_SIZE,
@@ -219,11 +284,8 @@ def test_ref_path_cost_kernel(ctx: DeviceContext) raises:
     ctx.synchronize()
 
     var result = _read_buffer(ctx, costs, TRAJS)
-    # Traj 0: sum of per-traj-point min distances = 0+0+0+1 = 1.0.
-    # avg = 1.0 / 4 = 0.25. final = 1.0 * 0.25 = 0.25.
-    assert_almost_equal(result[0], 0.25, atol=0.01, msg="ref_path: traj 0")
-    # Traj 1: sum = 1+1+1+sqrt(2) ≈ 4.4142. avg = 4.4142/4 ≈ 1.1036.
-    assert_almost_equal(result[1], 1.1036, atol=0.02, msg="ref_path: traj 1")
+    assert_almost_equal(result[0], 0.375, atol=0.01, msg="ref_path: traj 0")
+    assert_almost_equal(result[1], 0.9054, atol=0.02, msg="ref_path: traj 1")
     assert_true(result[0] < result[1], "ref_path: traj 0 should be < traj 1")
     print("  PASS: ref_path_cost_kernel (traj0=", result[0], "traj1=", result[1], ")")
 
@@ -326,6 +388,7 @@ def main() raises:
     print("Running cost evaluator tests on:", ctx.name())
 
     test_goal_cost_kernel(ctx)
+    test_goal_cost_tie_breaker(ctx)
     test_smoothness_cost_kernel(ctx)
     test_jerk_cost_kernel(ctx)
     test_ref_path_cost_kernel(ctx)

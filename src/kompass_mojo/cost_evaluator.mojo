@@ -38,34 +38,84 @@ comptime F32_INF: F32 = F32_MAX       # padding sentinel (large enough)
 # ---------------------------------------------------------------------------
 # 1. goal_cost_kernel
 #
-# SYCL: cost_evaluator_gpu.cpp:546-573 (goalCostKernel)
-# One thread per trajectory, distance from last trajectory point to the goal,
-# normalized by reference-path length, atomically added to the trajectory
-# cost.
+# SYCL: cost_evaluator_gpu.cpp:546-654 (goalCostKernel)
+# Distance-along-path goal cost. One block per trajectory.
+# Each thread strides over tracked-segment points, keeping a per-thread
+# argmin over (squared distance, accumulated arc length). The block then
+# tree-reduces the (min_dist_sq, closest_acc) pair in shared memory, and
+# thread 0 computes:
+#     arc_remaining_normalized = (ref_path_length - closest_acc) / ref_path_length
+#     tie_breaker              = sqrt(min_dist_sq) / ref_path_length
+#     cost = weight * (arc_remaining_normalized + tie_breaker)
+# tracked_acc holds absolute prefix arc lengths on the FULL reference path,
+# so no segment-to-absolute index conversion is needed in the kernel.
 # ---------------------------------------------------------------------------
 
 
 def goal_cost_kernel(
     paths_x: UnsafePointer[F32, MutAnyOrigin],
     paths_y: UnsafePointer[F32, MutAnyOrigin],
+    tracked_x: UnsafePointer[F32, MutAnyOrigin],
+    tracked_y: UnsafePointer[F32, MutAnyOrigin],
+    tracked_acc: UnsafePointer[F32, MutAnyOrigin],
     costs: UnsafePointer[F32, MutAnyOrigin],
-    trajs_size: Int,
     path_size: Int,
-    goal_x: F32,
-    goal_y: F32,
+    seg_size: Int,
+    ref_path_length: F32,
     inv_path_length: F32,
     cost_weight: F32,
 ):
-    var tid = Int(global_idx.x)
-    if tid >= trajs_size:
-        return
+    var traj_idx = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
 
-    var last_idx = tid * path_size + (path_size - 1)
-    var dx = paths_x[last_idx] - goal_x
-    var dy = paths_y[last_idx] - goal_y
-    var distance = sqrt(dx * dx + dy * dy) * inv_path_length
+    # Trajectory endpoint (broadcast: every thread in the WG reads the same
+    # cell from L1).
+    var last_idx = traj_idx * path_size + (path_size - 1)
+    var tx = paths_x[last_idx]
+    var ty = paths_y[last_idx]
 
-    _ = Atomic.fetch_add(costs + tid, cost_weight * distance)
+    # SLM partials for the (dist_sq, acc) argmin reduction.
+    var slm_min_dist = stack_allocation[
+        WG_SIZE, F32, address_space=AddressSpace.SHARED
+    ]()
+    var slm_closest_acc = stack_allocation[
+        WG_SIZE, F32, address_space=AddressSpace.SHARED
+    ]()
+
+    # Per-thread strided argmin over tracked-segment points. In the common
+    # case seg_size <= WG_SIZE the loop runs once.
+    var local_min_sq: F32 = F32_MAX
+    var local_closest_acc: F32 = 0.0
+    var i = tid
+    while i < seg_size:
+        var dx = tracked_x[i] - tx
+        var dy = tracked_y[i] - ty
+        var d_sq = dx * dx + dy * dy
+        if d_sq < local_min_sq:
+            local_min_sq = d_sq
+            local_closest_acc = tracked_acc[i]
+        i = i + WG_SIZE
+
+    slm_min_dist[tid] = local_min_sq
+    slm_closest_acc[tid] = local_closest_acc
+    barrier()
+
+    # Tree reduction in SLM, carrying the (dist_sq, acc) pair.
+    comptime for step in range(LOG2_WG):
+        var stride = WG_SIZE >> (step + 1)
+        if tid < stride:
+            if slm_min_dist[tid + stride] < slm_min_dist[tid]:
+                slm_min_dist[tid] = slm_min_dist[tid + stride]
+                slm_closest_acc[tid] = slm_closest_acc[tid + stride]
+        barrier()
+
+    if tid == 0:
+        var opt_dist_sq = slm_min_dist[0]
+        var opt_acc = slm_closest_acc[0]
+        var arc_remaining_normalized = (ref_path_length - opt_acc) * inv_path_length
+        var tie_breaker = sqrt(opt_dist_sq) * inv_path_length
+        var final_val = cost_weight * (arc_remaining_normalized + tie_breaker)
+        _ = Atomic.fetch_add(costs + traj_idx, final_val)
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +261,7 @@ def ref_path_cost_kernel(
     path_size: Int,             # numPointsPerTrajectory_
     ref_size: Int,              # tracked_segment_size
     inv_traj_size_count: F32,   # 1 / pathSize
+    inv_segment_length: F32,    # 1 / tracked_segment_length
     cost_weight: F32,
 ):
     var traj_idx = Int(block_idx.x)
@@ -284,7 +335,15 @@ def ref_path_cost_kernel(
         var total_dist_sum = partials[0]
         var avg_path_dist = total_dist_sum * inv_traj_size_count
 
-        var final_val = cost_weight * avg_path_dist
+        # End-point cost (last traj point <-> last ref point), normalized by
+        # the tracked-segment length.
+        var last_traj_idx = traj_idx * path_size + (path_size - 1)
+        var last_ref_idx = ref_size - 1
+        var end_dx = paths_x[last_traj_idx] - tracked_x[last_ref_idx]
+        var end_dy = paths_y[last_traj_idx] - tracked_y[last_ref_idx]
+        var end_dist = sqrt(end_dx * end_dx + end_dy * end_dy) * inv_segment_length
+
+        var final_val = cost_weight * ((avg_path_dist + end_dist) * F32(0.5))
         _ = Atomic.fetch_add(costs + traj_idx, final_val)
 
 
