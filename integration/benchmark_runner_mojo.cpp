@@ -149,24 +149,20 @@ static void generate_mapping_scan(size_t num_points,
 }
 
 
+// Tracked segment from kompass-core's getSegment(0): 1000 points at 0.01m
+// spanning x = [0, 9.99]. Full path length (10.0 m) is passed separately.
 static FlatRefPath generate_ref_path_flat() {
     FlatRefPath r;
-    // Match kompass-core's reference_path.interpolate(0.01, LINEAR) on waypoints
-    // (0,0)-(5,0)-(10,0) which produces 1001 points at 0.01m spacing from x=0
-    // to x=10.0 inclusive. segment(1000.0, 1000) keeps all 1001 since length <
-    // 1000.0 and n <= 1000+1.
-    int n = 1001;
+    int n = 1000;
     r.x.reserve(n);
     r.y.reserve(n);
     r.acc.reserve(n);
     for (int i = 0; i < n; ++i) {
         r.x.push_back(static_cast<float>(i * 0.01));
         r.y.push_back(0.0f);
-        // Straight path interpolated at 0.01 m -> prefix arc length per
-        // index is exactly i * 0.01.
         r.acc.push_back(static_cast<float>(i * 0.01));
     }
-    r.length = static_cast<float>((n - 1) * 0.01);  // 10.0 m
+    r.length = static_cast<float>((n - 1) * 0.01);
     return r;
 }
 
@@ -226,7 +222,7 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
-    // --- Workload ---
+    const float full_ref_path_length = 10.0f;
     float out_min_cost = 0.0f;
     int32_t out_min_idx = -1;
     auto workload = [&]() {
@@ -237,9 +233,8 @@ int main(int argc, char* argv[]) {
             samples.num_samples,
             ref_path.x.data(), ref_path.y.data(), ref_path.acc.data(),
             static_cast<int32_t>(ref_path.x.size()),
-            ref_path.length,  // tracked_segment_length
-            ref_path.length,  // ref_path_length
-            nullptr, nullptr, 0,  // no obstacles
+            ref_path.length, full_ref_path_length,
+            nullptr, nullptr, 0,
             &out_min_cost, &out_min_idx);
         if (rc != 0) {
             LOG_ERROR("mojo_cost_eval_run returned " << rc);
@@ -275,8 +270,7 @@ int main(int argc, char* argv[]) {
         mcfg.laserscan_pos_x = 0.0f;
         mcfg.laserscan_pos_y = 0.0f;
         mcfg.laserscan_pos_z = 0.0f;
-        // Pointcloud-only fields — laserscan path ignores these
-        mcfg.min_height = 0.1f;
+        mcfg.min_height = 0.0f;
         mcfg.max_height = 2.0f;
         mcfg.range_max = 20.0f;
 
@@ -341,13 +335,12 @@ int main(int argc, char* argv[]) {
             return 3;
         }
 
-        // 100k random PointXYZ matching the CriticalZone benchmark below
-        // (16 B / point, x/y/z float32 at 0/4/8). Reproducible seed.
+        // 100k random PointXYZ from default-seed rand(): RNG iters [0, 300k).
+        // 16B/point, x/y/z float32 at 0/4/8.
         const int pc_count = 100000;
         const int pc_stride = 16;
         std::vector<int8_t> cloud(static_cast<size_t>(pc_count) * pc_stride);
         {
-            std::srand(42);
             float* fp = reinterpret_cast<float*>(cloud.data());
             for (int i = 0; i < pc_count; ++i) {
                 fp[i * 4 + 0] = (std::rand() % 2000) / 100.0f - 10.0f;
@@ -433,13 +426,12 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // ---- Pointcloud input: 100k random PointXYZ (x,y in [-10,10), z in [0,3)) ----
-        // 16B/point, x/y/z float32 at 0/4/8.
+        // 100k random PointXYZ. Second cloud generated this run — RNG iters
+        // [300k, 600k). 16B/point, x/y/z float32 at 0/4/8.
         const int pc_count = 100000;
         const int pc_stride = 16;
         std::vector<int8_t> cz_cloud(static_cast<size_t>(pc_count) * pc_stride);
         {
-            std::srand(42);  // reproducible inputs
             float* fp = reinterpret_cast<float*>(cz_cloud.data());
             for (int i = 0; i < pc_count; ++i) {
                 fp[i * 4 + 0] = (std::rand() % 2000) / 100.0f - 10.0f;
