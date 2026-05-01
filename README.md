@@ -116,7 +116,17 @@ Benchmark names match kompass-core's suite exactly, so you can drop this file al
 | `CriticalZone_Dense_Scan` | 0.171 ms            | 0.120 ms                    |
 | `CriticalZone_100k_Cloud` | 0.690 ms            | 0.373 ms                    |
 
-Max-power-profile numbers TBD. Mojo runtime is fed via the `cuda-compat-orin-13-2` forward-compatibility package because JetPack 6.x ships driver 540.x while Mojo 1.0+ requires driver 580+.
+### Jetson Orin AGX (NVIDIA Ampere `sm_87`, max power profile / 50 W)
+
+| Benchmark                 | kompass-core (SYCL) | kompass-mojo (Mojo nightly) |
+| ------------------------- | ------------------- | --------------------------- |
+| `CostEvaluator_5k_Trajs`  | 42.77 ms            | 38.96 ms                    |
+| `Mapper_Dense_400x400`    | 0.667 ms            | 0.620 ms                    |
+| `Mapper_PointCloud_100k`  | 0.755 ms            | 0.975 ms                    |
+| `CriticalZone_Dense_Scan` | 0.167 ms            | 0.105 ms                    |
+| `CriticalZone_100k_Cloud` | 0.790 ms            | 0.441 ms                    |
+
+Mojo runtime on Jetson is fed via the `cuda-compat-orin-13-2` forward-compatibility package because JetPack 6.x ships driver 540.x while Mojo 1.0+ requires driver 580+.
 
 Numbers are mean over 50 iterations.
 
