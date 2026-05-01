@@ -62,7 +62,7 @@ def _fill_f32(
     ctx: DeviceContext, buf: DeviceBuffer[DType.float32], values: List[Float32],
 ) raises:
     var host = ctx.enqueue_create_host_buffer[DType.float32](len(values))
-    var ptr = host.unsafe_ptr().value()
+    var ptr = host.unsafe_ptr()
     for i in range(len(values)):
         (ptr + i)[] = values[i]
     ctx.enqueue_copy(dst_buf=buf, src_buf=host)
@@ -73,7 +73,7 @@ def _fill_i32(
     ctx: DeviceContext, buf: DeviceBuffer[DType.int32], values: List[Int32],
 ) raises:
     var host = ctx.enqueue_create_host_buffer[DType.int32](len(values))
-    var ptr = host.unsafe_ptr().value()
+    var ptr = host.unsafe_ptr()
     for i in range(len(values)):
         (ptr + i)[] = values[i]
     ctx.enqueue_copy(dst_buf=buf, src_buf=host)
@@ -84,7 +84,7 @@ def _fill_i8(
     ctx: DeviceContext, buf: DeviceBuffer[DType.int8], values: List[Int8],
 ) raises:
     var host = ctx.enqueue_create_host_buffer[DType.int8](len(values))
-    var ptr = host.unsafe_ptr().value()
+    var ptr = host.unsafe_ptr()
     for i in range(len(values)):
         (ptr + i)[] = values[i]
     ctx.enqueue_copy(dst_buf=buf, src_buf=host)
@@ -94,7 +94,7 @@ def _fill_i8(
 def _read_f32(ctx: DeviceContext, buf: DeviceBuffer[DType.float32], n: Int) raises -> List[Float32]:
     var result = List[Float32]()
     with buf.map_to_host() as mapped:
-        var ptr = mapped.unsafe_ptr().value()
+        var ptr = mapped.unsafe_ptr()
         for i in range(n):
             result.append(Float32((ptr + i)[]))
     return result^

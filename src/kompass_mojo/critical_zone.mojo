@@ -22,7 +22,7 @@
 
 from std.math import sqrt
 from std.memory import UnsafePointer, stack_allocation
-from std.os.atomic import Atomic
+from std.atomic import Atomic
 from std.gpu import (
     barrier,
     block_dim,

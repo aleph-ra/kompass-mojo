@@ -33,7 +33,7 @@ def _fill_buffer(
 ) raises:
     """Fill a device buffer from a list of floats."""
     var host = ctx.enqueue_create_host_buffer[DTYPE](len(values))
-    var ptr = host.unsafe_ptr().value()
+    var ptr = host.unsafe_ptr()
     for i in range(len(values)):
         (ptr + i)[] = values[i]
     ctx.enqueue_copy(dst_buf=buf, src_buf=host)
@@ -48,7 +48,7 @@ def _read_buffer(
     """Read n floats from a device buffer."""
     var result = List[Float32]()
     with buf.map_to_host() as mapped:
-        var ptr = mapped.unsafe_ptr().value()
+        var ptr = mapped.unsafe_ptr()
         for i in range(n):
             result.append(Float32((ptr + i)[]))
     return result^

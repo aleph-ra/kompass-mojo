@@ -28,7 +28,7 @@ from kompass_mojo.local_mapper import (
 
 def _fill_f64(ctx: DeviceContext, buf: DeviceBuffer[DType.float64], values: List[Float64]) raises:
     var host = ctx.enqueue_create_host_buffer[DType.float64](len(values))
-    var ptr = host.unsafe_ptr().value()
+    var ptr = host.unsafe_ptr()
     for i in range(len(values)):
         (ptr + i)[] = values[i]
     ctx.enqueue_copy(dst_buf=buf, src_buf=host)
@@ -38,7 +38,7 @@ def _fill_f64(ctx: DeviceContext, buf: DeviceBuffer[DType.float64], values: List
 def _read_grid(ctx: DeviceContext, grid: DeviceBuffer[DType.int32], n: Int) raises -> List[Int32]:
     var result = List[Int32]()
     with grid.map_to_host() as mapped:
-        var ptr = mapped.unsafe_ptr().value()
+        var ptr = mapped.unsafe_ptr()
         for i in range(n):
             result.append(Int32((ptr + i)[]))
     return result^
@@ -55,7 +55,7 @@ def _fill_distances(
     """Per-cell distance from the laserscan origin. Mirrors
     local_mapper_gpu.h:37-43 — kernel reads `distances[x + y*rows]`."""
     var host = ctx.enqueue_create_host_buffer[DType.float32](rows * cols)
-    var ptr = host.unsafe_ptr().value()
+    var ptr = host.unsafe_ptr()
     for j in range(cols):
         for i in range(rows):
             var dx = Float32(central_x - Int32(i)) * resolution - lpos_x
@@ -134,7 +134,7 @@ def _run_mapper(
     _fill_f64(ctx, angles, angles_vals)
     # Convert host doubles → device float32 (matches kompass-core's path).
     var ranges_host = ctx.enqueue_create_host_buffer[DType.float32](scan_size)
-    var rh_ptr = ranges_host.unsafe_ptr().value()
+    var rh_ptr = ranges_host.unsafe_ptr()
     for i in range(scan_size):
         (rh_ptr + i)[] = Float32(ranges_vals[i])
     ctx.enqueue_copy(dst_buf=ranges, src_buf=ranges_host)
@@ -361,7 +361,7 @@ def _run_pc_kernel(
 
     var raw = ctx.enqueue_create_buffer[DType.int8](total_bytes)
     var raw_host = ctx.enqueue_create_host_buffer[DType.int8](total_bytes)
-    var rh_ptr = raw_host.unsafe_ptr().value().bitcast[Float32]()
+    var rh_ptr = raw_host.unsafe_ptr().bitcast[Float32]()
     for i in range(num_points):
         (rh_ptr + (i * 4 + 0))[] = points_xyz[i * 3 + 0]
         (rh_ptr + (i * 4 + 1))[] = points_xyz[i * 3 + 1]
@@ -396,7 +396,7 @@ def _run_pc_kernel(
 
     var out = List[Float32]()
     with ranges.map_to_host() as mapped:
-        var ptr = mapped.unsafe_ptr().value()
+        var ptr = mapped.unsafe_ptr()
         for i in range(num_bins):
             out.append((ptr + i)[])
     return out^
@@ -434,7 +434,7 @@ def _run_pc_mapper(
 
     var raw = ctx.enqueue_create_buffer[DType.int8](total_bytes)
     var raw_host = ctx.enqueue_create_host_buffer[DType.int8](total_bytes)
-    var rh_ptr = raw_host.unsafe_ptr().value().bitcast[Float32]()
+    var rh_ptr = raw_host.unsafe_ptr().bitcast[Float32]()
     for i in range(num_points):
         (rh_ptr + (i * 4 + 0))[] = points_xyz[i * 3 + 0]
         (rh_ptr + (i * 4 + 1))[] = points_xyz[i * 3 + 1]
@@ -460,7 +460,7 @@ def _run_pc_mapper(
 
     # Per-bin angles: i * 2π/num_bins (the kernel uses the same convention).
     var ang_host = ctx.enqueue_create_host_buffer[DType.float64](num_bins)
-    var ah_ptr = ang_host.unsafe_ptr().value()
+    var ah_ptr = ang_host.unsafe_ptr()
     var step = (2.0 * pi) / Float64(num_bins)
     for k in range(num_bins):
         (ah_ptr + k)[] = Float64(k) * step

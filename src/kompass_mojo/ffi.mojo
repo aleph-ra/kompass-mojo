@@ -453,7 +453,7 @@ struct MapperHandle(Movable):
 
         # Precompute per-cell distance from laserscan origin
         var host_dist = self.ctx.enqueue_create_host_buffer[DType.float32](cells)
-        var dst = host_dist.unsafe_ptr().value()
+        var dst = host_dist.unsafe_ptr()
         for j in range(cols):
             for i in range(rows):
                 var dest_x = F32(self.central_x - Int32(i)) * cfg.resolution
@@ -470,7 +470,7 @@ struct MapperHandle(Movable):
         # the laserscan path overwrites these per call (so this seed only
         # matters for the pointcloud path).
         var host_ang = self.ctx.enqueue_create_host_buffer[DType.float64](scan_size)
-        var ang_ptr = host_ang.unsafe_ptr().value()
+        var ang_ptr = host_ang.unsafe_ptr()
         var angle_step = (2.0 * Float64(pi)) / Float64(scan_size)
         for k in range(scan_size):
             (ang_ptr + k)[] = Float64(k) * angle_step
@@ -543,7 +543,7 @@ def _mapper_run_impl(
     # kompass-core's m_hostFloatRanges staging, atomic_min on float32 is
     # cheaper than float64 on most GPUs).
     h.ctx.enqueue_copy(dst_buf=h.angles, src_ptr=host_angles)
-    var ranges_f32_ptr = h.ranges_host_f32.unsafe_ptr().value()
+    var ranges_f32_ptr = h.ranges_host_f32.unsafe_ptr()
     for i in range(h.scan_size):
         (ranges_f32_ptr + i)[] = Float32(host_ranges[i])
     h.ctx.enqueue_copy(dst_buf=h.ranges, src_buf=h.ranges_host_f32)
@@ -770,8 +770,8 @@ struct CritZoneHandle(Movable):
             # the body-frame point (tf00*c + tf01*s + tf03, tf10*c + tf11*s + tf13).
             var host_cos = self.ctx.enqueue_create_host_buffer[DTYPE](scan_size)
             var host_sin = self.ctx.enqueue_create_host_buffer[DTYPE](scan_size)
-            var cos_ptr = host_cos.unsafe_ptr().value()
-            var sin_ptr = host_sin.unsafe_ptr().value()
+            var cos_ptr = host_cos.unsafe_ptr()
+            var sin_ptr = host_sin.unsafe_ptr()
             var host_fwd = List[Int32]()
             var host_bwd = List[Int32]()
 
@@ -808,7 +808,7 @@ struct CritZoneHandle(Movable):
                 var host_fwd_buf = self.ctx.enqueue_create_host_buffer[
                     DType.int32
                 ](self.n_fwd)
-                var fwd_ptr = host_fwd_buf.unsafe_ptr().value()
+                var fwd_ptr = host_fwd_buf.unsafe_ptr()
                 for i in range(self.n_fwd):
                     (fwd_ptr + i)[] = host_fwd[i]
                 self.ctx.enqueue_copy(
@@ -818,7 +818,7 @@ struct CritZoneHandle(Movable):
                 var host_bwd_buf = self.ctx.enqueue_create_host_buffer[
                     DType.int32
                 ](self.n_bwd)
-                var bwd_ptr = host_bwd_buf.unsafe_ptr().value()
+                var bwd_ptr = host_bwd_buf.unsafe_ptr()
                 for i in range(self.n_bwd):
                     (bwd_ptr + i)[] = host_bwd[i]
                 self.ctx.enqueue_copy(
