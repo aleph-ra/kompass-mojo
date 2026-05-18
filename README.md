@@ -128,6 +128,16 @@ Benchmark names match kompass-core's suite exactly, so you can drop this file al
 
 Mojo runtime on Jetson is fed via the `cuda-compat-orin-13-2` forward-compatibility package because JetPack 6.x ships driver 540.x while Mojo 1.0+ requires driver 580+.
 
+### AMD Strix Halo APU (RDNA 3.5 `gfx1151`, ROCm)
+
+| Benchmark                 | kompass-core (SYCL/ROCm) | kompass-mojo (Mojo nightly) |
+| ------------------------- | ------------------------ | --------------------------- |
+| `CostEvaluator_5k_Trajs`  | 8.18 ms                  | 7.69 ms                     |
+| `Mapper_Dense_400x400`    | 0.226 ms                 | 0.192 ms                    |
+| `Mapper_PointCloud_100k`  | 0.238 ms                 | 0.196 ms                    |
+| `CriticalZone_Dense_Scan` | 0.026 ms                 | 0.023 ms                    |
+| `CriticalZone_100k_Cloud` | 0.056 ms                 | 0.062 ms                    |
+
 Numbers are mean over 50 iterations.
 
 ## Relationship to kompass-core
